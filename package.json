@@ -1,0 +1,37 @@
+{
+  "name": "dsh-lark",
+  "description": "Lark/Feishu bridge bundle: drive dsh sessions from chat messages and reply in chat",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "main": "lib/index.mjs",
+  "files": [
+    "lib/index.mjs",
+    "cordis.patch.yml"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "scripts": {
+    "build": "tsdown",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "*",
+    "@deepseek-ai/dsh-agent": "*",
+    "@deepseek-ai/dsh-agent-default-model": "*",
+    "@deepseek-ai/dsh-brand": "*",
+    "@deepseek-ai/dsh-llm": "*",
+    "@deepseek-ai/dsh-session": "*",
+    "@deepseek-ai/dsh-session-title": "*",
+    "@deepseek-ai/dsh-util-values": "*",
+    "@deepseek-ai/dsh-workspace": "*",
+    "@deepseek-ai/schemastery": "*"
+  },
+  "devDependencies": {
+    "tsdown": "^0.22.2",
+    "vitest": "^4.1.8"
+  }
+}

@@ -1,0 +1,24 @@
+{
+  // Typecheck the bundle against the built declarations of its DSH dependencies.
+  "extends": "../tsconfig.base.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": "src",
+    "outDir": "lib/types"
+  },
+  "include": ["src"],
+  "references": [
+    { "path": "../vendor/cordis" },
+    { "path": "../vendor/schemastery" },
+    { "path": "../packages/core/agent" },
+    { "path": "../packages/core/agent-default-model" },
+    { "path": "../packages/core/session" },
+    { "path": "../packages/interaction/permission-presets" },
+    { "path": "../packages/llm/llm" },
+    { "path": "../packages/preset/agent-presets" },
+    { "path": "../packages/session/session-title" },
+    { "path": "../packages/util/brand" },
+    { "path": "../packages/util/values" },
+    { "path": "../packages/workspace/workspace" }
+  ]
+}
