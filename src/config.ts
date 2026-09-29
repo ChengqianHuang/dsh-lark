@@ -32,6 +32,8 @@ export interface Config {
   agentPreset?: string
   /** Optional permission preset applied to every driven session. */
   permissionPreset?: string
+  /** Bot display name for exact @mention stripping; auto-detected when absent. */
+  botName?: string
 }
 
 /** Resolved deployment settings; defaults were computed once at resolve. */
@@ -49,6 +51,7 @@ export interface LarkSettings {
   titlePrefix: string
   agentPreset: string | undefined
   permissionPreset: string | undefined
+  botName: string | undefined
 }
 
 /** Validate one optional non-empty string, returning the default when absent. */
@@ -131,5 +134,6 @@ export function resolveLarkConfig(config: Config): LarkSettings {
     titlePrefix: optionalString(config.titlePrefix, '[lark] ', 'titlePrefix'),
     agentPreset: optionalPreset(config.agentPreset, 'agentPreset'),
     permissionPreset: optionalPreset(config.permissionPreset, 'permissionPreset'),
+    botName: optionalPreset(config.botName, 'botName'),
   }
 }

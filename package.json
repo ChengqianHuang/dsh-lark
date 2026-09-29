@@ -1,7 +1,7 @@
 {
   "name": "dsh-lark",
   "description": "Lark/Feishu bridge bundle: drive dsh sessions from chat messages and reply in chat",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "main": "lib/index.mjs",

@@ -29,10 +29,11 @@ import type {} from '@deepseek-ai/dsh-workspace'
 
 import { mkdir } from 'node:fs/promises'
 import { Service, type Context } from '@deepseek-ai/cordis'
+import { errorChain } from '@deepseek-ai/dsh-llm'
 import z from '@deepseek-ai/schemastery'
 import { ChatRouter } from './bridge.ts'
 import { resolveLarkConfig, type Config } from './config.ts'
-import { assertLarkCliAvailable, LarkEgress } from './egress.ts'
+import { assertLarkCliAvailable, fetchBotName, LarkEgress } from './egress.ts'
 import { shouldAccept } from './filter.ts'
 import { LarkIngest } from './ingress.ts'
 
@@ -57,6 +58,7 @@ export class LarkService extends Service {
     titlePrefix: z.string(),
     agentPreset: z.string(),
     permissionPreset: z.string(),
+    botName: z.string(),
   })
 
   private readonly rawConfig: Config
@@ -83,18 +85,27 @@ export class LarkService extends Service {
    */
   protected async [Service.init](): Promise<void> {
     const settings = resolveLarkConfig(this.rawConfig)
-    this.settings = settings
-    await mkdir(settings.workspacePath, { recursive: true })
-    await assertLarkCliAvailable(settings.larkCliPath)
-    const egress = new LarkEgress(settings.larkCliPath, EGRESS_TIMEOUT_MS)
-    const router = new ChatRouter(this.ctx, settings, egress)
+    let botName = settings.botName
+    if (botName === undefined) {
+      try {
+        botName = await fetchBotName(settings.larkCliPath, settings.identity)
+      } catch (error: unknown) {
+        this.ctx.logger.warn(`dsh-lark: bot name auto-detection failed (mention stripping falls back to the first-token heuristic): ${errorChain(error)}`)
+      }
+    }
+    const effectiveSettings = settings.botName === botName ? settings : { ...settings, botName }
+    this.settings = effectiveSettings
+    await mkdir(effectiveSettings.workspacePath, { recursive: true })
+    await assertLarkCliAvailable(effectiveSettings.larkCliPath)
+    const egress = new LarkEgress(effectiveSettings.larkCliPath, EGRESS_TIMEOUT_MS)
+    const router = new ChatRouter(this.ctx, effectiveSettings, egress)
     const ingest = new LarkIngest(
-      settings.larkCliPath,
-      ['event', 'consume', settings.eventKey, '--as', settings.identity],
+      effectiveSettings.larkCliPath,
+      ['event', 'consume', effectiveSettings.eventKey, '--as', effectiveSettings.identity],
       {
         logger: this.ctx.logger,
         onEvent: event => {
-          if (!shouldAccept(event, settings)) return
+          if (!shouldAccept(event, effectiveSettings)) return
           this.ctx.logger.info(`dsh-lark: accepted ${event.chatType} message ${event.messageId} from ${event.senderId}`)
           router.handle(event)
         },

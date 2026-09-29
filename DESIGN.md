@@ -29,6 +29,10 @@ lark-cli `event consume` 有明确协议，本插件逐条兑现：
 
 一个 chat 一个活跃会话，`lastActiveAt` 惰性判断过期（无定时器），过期后旧会话 `handle.dispose()`、下一条消息开新会话。每条消息一次 `followup`（独立回合）而不是 `steer`（打断当前步）：遥控场景下「新命令」比「插话」常见，打断留给未来的配置项。同一 chat 的处理链用 promise 串行，保证回复与触发消息的对应关系；会话运行中再来的消息由 agent inbox 自然排队。
 
+## 斜杠命令与 @前缀剥离
+
+桥接命令在 mention 剥离后解析：`/name` 控制桥接本身，不进 agent；未知命令回提示而非转发，避免误触发回合。`/stop` 旁路 per-chat 串行链立即执行——排队中的 stop 永远追不上正在运行的回合，cancel 用 `{ kind: 'user' }`，被停的回合以 `aborted` 结束并回复「已停止本轮」；其余命令照常排队，与回合保持先后次序。机器人显示名在加载时经 `bot/v3/info` 自动获取（`botName` 配置可覆盖，探测失败不阻塞加载），群消息按精确名字剥离 @前缀，agent 收到的是干净文本；拿不到名字时退化为首 token 启发式。
+
 ## 回复策略
 
 最后一段 assistant 文本 → 截断到 `maxReplyChars` → `+messages-reply` 锚定触发消息；回复失败降级 `+messages-send`，再失败记日志。没有输出文本的回合（纯工具执行）和错误回合都发兜底文案——飞书侧永远有反馈。lark-cli 调用一律 argv 数组（`execFile`），不走 shell。

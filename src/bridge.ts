@@ -5,6 +5,11 @@
  * last assistant text is replied back to the triggering message. Per-chat
  * handler chains serialize creation and replies while the agent queues its
  * own turns.
+ *
+ * Messages whose mention-stripped text parses as a bridge command
+ * (`/new`, `/status`, `/help`, unknown names) run on the same per-chat chain
+ * so they serialize with turns; `/stop` bypasses the chain and acts
+ * immediately, because a queued stop could never reach a running turn.
  * @module
  */
 
@@ -15,6 +20,7 @@ import { brandString } from '@deepseek-ai/dsh-brand'
 import { createUserMessage, errorChain } from '@deepseek-ai/dsh-llm'
 import type { SessionId } from '@deepseek-ai/dsh-session'
 import type { LarkChatId } from './brand.ts'
+import { describeBridgeCommands, isKnownCommand, parseBridgeCommand, stripMention, type BridgeCommand } from './command.ts'
 import type { LarkSettings } from './config.ts'
 import type { Egress } from './egress.ts'
 import { summarizeTurn, type TurnOutcome } from './summary.ts'
@@ -26,12 +32,14 @@ interface ChatEntry {
   readonly agent: Agent
   readonly sessionId: SessionId
   lastActiveAt: number
+  /** `true` from followup until the turn settles; read by the immediate /stop path. */
+  running: boolean
 }
 
 /** First title line for a fresh session, bounded for the web UI listing. */
-function titleFromEvent(event: LarkMessageEvent): string {
-  const line = event.content.split('\n').map(candidate => candidate.trim()).find(candidate => candidate !== '')
-    ?? event.chatId
+function titleFromEvent(text: string, chatId: LarkChatId): string {
+  const line = text.split('\n').map(candidate => candidate.trim()).find(candidate => candidate !== '')
+    ?? chatId
   return line.slice(0, 40)
 }
 
@@ -39,8 +47,14 @@ function titleFromEvent(event: LarkMessageEvent): string {
 function replyTextFor(outcome: TurnOutcome): string {
   const text = outcome.text.trim()
   if (text !== '') return text
+  if (outcome.reason?.kind === 'aborted') return '已停止本轮。'
   if (outcome.reason?.kind === 'error') return `dsh 本轮出错：${outcome.reason.error.message}`
   return '（dsh 本轮没有文本输出）'
+}
+
+/** Whole minutes for status lines; sub-minute durations read as one minute. */
+function minutes(ms: number): string {
+  return `${Math.max(1, Math.round(ms / 60_000))} 分钟`
 }
 
 /** Route accepted Feishu messages into driven dsh sessions and reply in chat. */
@@ -53,7 +67,7 @@ export class ChatRouter {
   /**
    * Store the runtime context, resolved settings, and outbound messaging.
    * @param ctx - plugin context carrying the agent, preset, title, and workspace services.
-   * @param settings - resolved deployment settings.
+   * @param settings - resolved deployment settings, including the bot name for mention stripping.
    * @param egress - outbound Feishu messaging.
    */
   constructor(
@@ -63,12 +77,21 @@ export class ChatRouter {
   ) {}
 
   /**
-   * Dispatch one accepted message onto its chat's serialized chain; never throws.
+   * Dispatch one accepted message; never throws. `/stop` cancels the running
+   * turn immediately; everything else joins the chat's serialized chain.
    * @param event - accepted receive-message event.
    */
   handle(event: LarkMessageEvent): void {
     if (this.disposed) return
-    const tail = (this.chains.get(event.chatId) ?? Promise.resolve()).then(() => this.processChatMessage(event))
+    const text = stripMention(event.content, this.settings.botName)
+    const command = parseBridgeCommand(text)
+    if (command !== undefined && command.name === 'stop') {
+      void this.stopRunningTurn(event).catch(error => {
+        this.ctx.logger.warn(`dsh-lark: chat ${event.chatId} stop failed: ${errorChain(error)}`)
+      })
+      return
+    }
+    const tail = (this.chains.get(event.chatId) ?? Promise.resolve()).then(() => this.processMessage(event, text, command))
     this.chains.set(event.chatId, tail.catch(error => {
       this.ctx.logger.warn(`dsh-lark: chat ${event.chatId} handler failed: ${errorChain(error)}`)
     }))
@@ -94,13 +117,77 @@ export class ChatRouter {
     }
   }
 
+  /** Route one chained message to its command or turn handler. */
+  private async processMessage(event: LarkMessageEvent, text: string, command: BridgeCommand | undefined): Promise<void> {
+    if (command !== undefined) {
+      await this.processCommand(event, command)
+      return
+    }
+    if (text === '') return
+    await this.processChatMessage(event, text)
+  }
+
+  /** Execute one chained bridge command. */
+  private async processCommand(event: LarkMessageEvent, command: BridgeCommand): Promise<void> {
+    if (!isKnownCommand(command.name)) {
+      await this.reply(event, `未知命令 /${command.name}\n\n${describeBridgeCommands()}`)
+      return
+    }
+    if (command.name === 'new') {
+      const entry = this.chats.get(event.chatId)
+      if (entry === undefined) {
+        await this.reply(event, '当前没有活跃会话；下一条消息将创建新会话。')
+        return
+      }
+      this.chats.delete(event.chatId)
+      await this.disposeEntry(event.chatId, entry)
+      await this.reply(event, '已结束当前会话；下一条消息开始新会话。')
+      return
+    }
+    if (command.name === 'status') {
+      await this.reply(event, this.statusFor(event.chatId))
+      return
+    }
+    if (command.name === 'help') {
+      await this.reply(event, describeBridgeCommands())
+      return
+    }
+    // `/stop` never reaches the chain; this arm only keeps the switch exhaustive.
+  }
+
+  /** Cancel the chat's running turn now, replying only when there is nothing to stop. */
+  private async stopRunningTurn(event: LarkMessageEvent): Promise<void> {
+    const entry = this.chats.get(event.chatId)
+    if (entry === undefined) {
+      await this.reply(event, '当前没有活跃会话。')
+      return
+    }
+    if (!entry.running) {
+      await this.reply(event, '当前没有正在运行的回合。')
+      return
+    }
+    entry.agent.cancel({ kind: 'user' })
+  }
+
+  /** Compose the /status report for one chat. */
+  private statusFor(chatId: LarkChatId): string {
+    const entry = this.chats.get(chatId)
+    if (entry === undefined) return '当前没有活跃会话；下一条消息将创建新会话。'
+    const elapsedMs = Date.now() - entry.lastActiveAt
+    const remainingMs = Math.max(0, this.settings.sessionIdleMs - elapsedMs)
+    return [
+      `会话 ${entry.sessionId.slice(0, 13)}（${entry.running ? '运行中' : '空闲'}）`,
+      `上次活动：${minutes(elapsedMs)}前；${minutes(remainingMs)}后闲置到期`,
+    ].join('\n')
+  }
+
   /** Run one message through create-or-reuse, one turn, and the reply. */
-  private async processChatMessage(event: LarkMessageEvent): Promise<void> {
+  private async processChatMessage(event: LarkMessageEvent, text: string): Promise<void> {
     try {
-      const entry = await this.ensureEntry(event.chatId, titleFromEvent(event))
+      const entry = await this.ensureEntry(event.chatId, titleFromEvent(text, event.chatId))
       const firstSeq = entry.agent.session.seq
       entry.agent.followup(createUserMessage({
-        content: [{ type: 'text', text: event.content }],
+        content: [{ type: 'text', text }],
         source: {
           kind: 'lark',
           chatId: event.chatId,
@@ -110,7 +197,12 @@ export class ChatRouter {
         },
       }))
       entry.lastActiveAt = Date.now()
-      await entry.agent.whenIdle()
+      entry.running = true
+      try {
+        await entry.agent.whenIdle()
+      } finally {
+        entry.running = false
+      }
       entry.lastActiveAt = Date.now()
       const outcome = summarizeTurn(entry.agent.session, firstSeq)
       await this.reply(event, replyTextFor(outcome))
@@ -193,7 +285,7 @@ export class ChatRouter {
       }
       throw error
     }
-    const entry: ChatEntry = { handle, agent: handle.agent, sessionId, lastActiveAt: Date.now() }
+    const entry: ChatEntry = { handle, agent: handle.agent, sessionId, lastActiveAt: Date.now(), running: false }
     this.chats.set(chatId, entry)
     return entry
   }
