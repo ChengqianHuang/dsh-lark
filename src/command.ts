@@ -1,76 +1,65 @@
-/**
- * In-chat bridge commands: messages whose text is a `/name` token control the
- * bridge itself instead of driving an agent turn. Mention prefixes are
- * stripped first, so `@bot /new` in a group and `/new` in a P2P chat behave
- * identically. Unknown commands are rejected with the command list rather
- * than forwarded to the agent.
- * @module
- */
+/** Parsing of bot mentions and bridge commands. @module */
 
-/** One parsed bridge command. */
+import type { Locale } from './config.ts'
+import { copy } from './i18n.ts'
+
+/** A slash command and its optional argument. */
 export interface BridgeCommand {
-  /** Command name without the leading slash, lowercased. */
   readonly name: string
-  /** Raw remainder after the name; empty when absent. */
   readonly argument: string
 }
 
-/** Bridge commands recognized by the router, in help order. */
+/** Supported commands in help order. */
 export const BRIDGE_COMMANDS = ['new', 'stop', 'status', 'help'] as const
 
-/** One-line description per bridge command, in help order. */
-const COMMAND_HELP: Readonly<Record<(typeof BRIDGE_COMMANDS)[number], string>> = {
-  new: '结束当前会话，下一条消息开始新会话',
-  stop: '停止正在运行的回合',
-  status: '查看当前会话状态',
-  help: '显示可用命令',
+/**
+ * Match the exact bot mention at the start of a rendered message.
+ * @param content - Text rendered by lark-cli.
+ * @param botName - Verified display name, including any spaces.
+ * @returns Whether the name is followed by whitespace or the end of text.
+ */
+export function hasBotMention(content: string, botName: string | undefined): boolean {
+  if (botName === undefined) return false
+  const text = content.trimStart()
+  const prefix = `@${botName}`
+  return text.startsWith(prefix) && (text.length === prefix.length || /\s/.test(text.charAt(prefix.length)))
 }
 
 /**
- * Strip a leading @mention from rendered message text. An exact
- * `@{botName}` prefix is preferred; without a known name the first
- * whitespace-bounded token is removed as a heuristic.
- * @param content - rendered Feishu message text.
- * @param botName - the bot display name, or `undefined` when unknown.
- * @returns the text after the mention, trimmed.
+ * Remove only a verified leading bot mention; preserve other @ text.
+ * @param content - Rendered message text.
+ * @param botName - Verified bot display name, if available.
+ * @returns Trimmed message text.
  */
 export function stripMention(content: string, botName: string | undefined): string {
-  const trimmed = content.trim()
-  if (!trimmed.startsWith('@')) return trimmed
-  if (botName !== undefined) {
-    const withName = `@${botName}`
-    if (trimmed.startsWith(withName)) return trimmed.slice(withName.length).trim()
-  }
-  const tokenEnd = trimmed.search(/\s/)
-  if (tokenEnd <= 1) return ''
-  return trimmed.slice(tokenEnd + 1).trim()
+  const text = content.trim()
+  return hasBotMention(text, botName) ? text.slice(`@${botName}`.length).trim() : text
 }
 
 /**
- * Parse one bridge command from prepared message text.
- * @param text - message text with any mention already stripped.
- * @returns the command, or `undefined` when the text is not a command.
+ * Parse slash-prefixed input so unknown commands cannot trigger agent work.
+ * @param text - Text after optional bot mention removal.
+ * @returns Command token and argument, or undefined for ordinary text.
  */
 export function parseBridgeCommand(text: string): BridgeCommand | undefined {
-  const match = /^\/([a-z][a-z0-9]*)(?:\s+([\s\S]+))?$/i.exec(text.trim())
-  if (match === null) return undefined
-  return { name: match[1]?.toLowerCase() ?? '', argument: match[2] ?? '' }
+  const match = /^\/([^\s]*)(?:\s+([\s\S]*))?$/.exec(text.trim())
+  return match === null ? undefined : { name: (match[1] ?? '').toLowerCase(), argument: match[2] ?? '' }
 }
 
 /**
- * Whether a parsed command name is one the router implements.
- * @param name - lowercased command name.
- * @returns `true` for a known bridge command.
+ * Check whether the command is supported.
+ * @param name - Lowercase command name.
+ * @returns True for one of the four bridge commands.
  */
-export function isKnownCommand(name: string): boolean {
+export function isKnownCommand(name: string): name is (typeof BRIDGE_COMMANDS)[number] {
   return (BRIDGE_COMMANDS as readonly string[]).includes(name)
 }
 
 /**
- * Render the command list for /help and unknown-command replies.
- * @returns the multi-line help text.
+ * Render localized command help.
+ * @param locale - Language of bridge replies.
+ * @returns Help text ready for a chat reply.
  */
-export function describeBridgeCommands(): string {
-  const lines = BRIDGE_COMMANDS.map(name => `/${name} — ${COMMAND_HELP[name]}`)
-  return ['可用命令：', ...lines].join('\n')
+export function describeBridgeCommands(locale: Locale = 'zh-CN'): string {
+  return copy[locale].help
 }

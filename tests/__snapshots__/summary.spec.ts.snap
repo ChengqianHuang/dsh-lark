@@ -1,0 +1,98 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`records a keyless conversation and the matching chat replies 1`] = `
+{
+  "recorded": [
+    {
+      "data": {
+        "content": [
+          {
+            "text": "Describe this workspace",
+            "type": "text",
+          },
+        ],
+        "source": {
+          "chatId": "oc_test",
+          "chatType": "p2p",
+          "kind": "lark",
+          "messageId": "om_one",
+          "senderId": "ou_owner",
+        },
+      },
+      "type": "user/message",
+    },
+    {
+      "data": {
+        "content": [
+          {
+            "text": "The workspace is ready.",
+            "type": "text",
+          },
+        ],
+        "turn": 1,
+      },
+      "type": "assistant/message",
+    },
+    {
+      "data": {
+        "reason": {
+          "kind": "completed",
+        },
+        "turn": 1,
+      },
+      "type": "turn/end",
+    },
+    {
+      "data": {
+        "content": [
+          {
+            "text": "Continue the review",
+            "type": "text",
+          },
+        ],
+        "source": {
+          "chatId": "oc_test",
+          "chatType": "p2p",
+          "kind": "lark",
+          "messageId": "om_two",
+          "senderId": "ou_owner",
+        },
+      },
+      "type": "user/message",
+    },
+    {
+      "data": {
+        "content": [
+          {
+            "text": "The follow-up is complete.",
+            "type": "text",
+          },
+        ],
+        "turn": 2,
+      },
+      "type": "assistant/message",
+    },
+    {
+      "data": {
+        "reason": {
+          "kind": "completed",
+        },
+        "turn": 2,
+      },
+      "type": "turn/end",
+    },
+  ],
+  "replies": [
+    {
+      "kind": "reply",
+      "target": "om_one",
+      "text": "The workspace is ready.",
+    },
+    {
+      "kind": "reply",
+      "target": "om_two",
+      "text": "The follow-up is complete.",
+    },
+  ],
+}
+`;

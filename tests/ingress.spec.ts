@@ -1,120 +1,158 @@
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { describe, expect, it } from 'vitest'
-import { READY_MARKER_PREFIX, LarkIngest } from '../src/ingress.ts'
+import { describe, expect, it, onTestFinished, vi } from 'vitest'
+import { LarkIngest } from '../src/ingress.ts'
 import { toChatId, toEventId, toMessageId, toOpenId } from '../src/brand.ts'
 import type { LarkMessageEvent } from '../src/types.ts'
 
 const fixture = fileURLToPath(new URL('./helpers/fake-lark-consume.mjs', import.meta.url))
-
-const EVENT: Record<string, unknown> = {
-  type: 'im.message.receive_v1',
-  event_id: 'ev-1',
-  message_id: 'om_1',
-  chat_id: 'oc_1',
-  chat_type: 'p2p',
-  message_type: 'text',
-  sender_id: 'ou_1',
-  content: '你好',
-  create_time: '1',
+const EVENT = {
+  type: 'im.message.receive_v1', event_id: 'ev-1', message_id: 'om_1', chat_id: 'oc_1',
+  chat_type: 'p2p', message_type: 'text', sender_id: 'ou_1', content: '你好', create_time: '1',
 }
 
-interface Captured {
-  events: LarkMessageEvent[]
-  exits: string[]
-  warns: string[]
-  infos: string[]
-}
-
-function runOnce(env: Record<string, string>): { ingest: LarkIngest; captured: Captured } {
-  const captured: Captured = { events: [], exits: [], warns: [], infos: [] }
-  const ingest = new LarkIngest(process.execPath, [fixture], {
-    onEvent: event => { captured.events.push(event) },
-    onUnexpectedExit: reason => { captured.exits.push(reason) },
-    logger: {
-      info: message => { captured.infos.push(message) },
-      warn: message => { captured.warns.push(message) },
+async function harness(scenario: Record<string, unknown> = {}, settings: { readyTimeoutMs?: number; dedupCapacity?: number; throwOnEvent?: boolean } = {}) {
+  const root = await mkdtemp(join(tmpdir(), 'dsh-lark-ingress-'))
+  const beforeReady = Promise.withResolvers<void>()
+  const eventArrived = Promise.withResolvers<void>()
+  const wrongMarker = Promise.withResolvers<void>()
+  const exit = Promise.withResolvers<void>()
+  const eof = Promise.withResolvers<void>()
+  const events: LarkMessageEvent[] = []
+  const exits: string[] = []
+  const warns: string[] = []
+  const options = {
+    ...scenario,
+    readyGate: scenario['gateReady'] ? join(root, 'ready') : undefined,
+    shutdownGate: scenario['gateShutdown'] ? join(root, 'shutdown') : undefined,
+    eofPath: join(root, 'eof'),
+    closedPath: join(root, 'closed'),
+  }
+  const ingest = new LarkIngest(process.execPath, [fixture, JSON.stringify(options)], {
+    onEvent: event => {
+      events.push(event)
+      eventArrived.resolve()
+      if (settings.throwOnEvent) throw new Error('subscriber broke')
     },
+    onUnexpectedExit: reason => { exits.push(reason); exit.resolve() },
+    logger: {
+      info: message => {
+        if (message.endsWith('fixture: before ready')) beforeReady.resolve()
+        if (message.endsWith('fixture: stdin closed')) eof.resolve()
+        if (message.endsWith('[event] ready event_key=im.message.message_read_v1')) wrongMarker.resolve()
+      },
+      warn: message => { warns.push(message) },
+    },
+  }, { eventKey: 'im.message.receive_v1', readyTimeoutMs: settings.readyTimeoutMs ?? 30_000, dedupCapacity: settings.dedupCapacity ?? 1_000 })
+  onTestFinished(async () => {
+    await writeFile(join(root, 'ready'), '')
+    await writeFile(join(root, 'shutdown'), '')
+    await ingest.dispose()
+    await rm(root, { recursive: true, force: true })
   })
-  for (const [key, value] of Object.entries(env)) process.env[key] = value
-  return { ingest, captured }
-}
-
-function cleanEnv(): void {
-  delete process.env.FAKE_EVENTS
-  delete process.env.FAKE_CRASH
+  return { ingest, events, exits, warns, root, beforeReady: beforeReady.promise, eventArrived: eventArrived.promise, exit: exit.promise, eof: eof.promise, wrongMarker: wrongMarker.promise }
 }
 
 describe('LarkIngest', () => {
-  it('dispatches events after the ready marker and deduplicates redeliveries', async () => {
-    process.env.FAKE_EVENTS = JSON.stringify([EVENT, EVENT])
-    const { ingest, captured } = runOnce({})
-    try {
-      ingest.start()
-      for (let i = 0; i < 100 && captured.events.length < 1; i++) await new Promise(resolve => setTimeout(resolve, 20))
-      expect(captured.exits).toEqual([])
-      expect(captured.events).toHaveLength(1)
-      expect(captured.events[0]).toMatchObject({ messageId: toMessageId('om_1'), chatId: toChatId('oc_1'), senderId: toOpenId('ou_1') })
-      expect(captured.events[0]?.eventId).toBe(toEventId('ev-1'))
-      expect(captured.infos.some(line => line.includes('ingress ready'))).toBe(true)
-    } finally {
-      await ingest.dispose()
-      cleanEnv()
-    }
-    expect(captured.exits).toEqual([])
+  it('waits for the exact ready marker and retains stdout that arrived first', async () => {
+    const h = await harness({ gateReady: true, beforeReady: [EVENT] })
+    const starting = h.ingest.start()
+    await h.beforeReady
+    expect(h.events).toEqual([])
+    await writeFile(join(h.root, 'ready'), '')
+    await starting
+    await h.eventArrived
+    expect(h.events[0]).toMatchObject({ messageId: toMessageId('om_1'), chatId: toChatId('oc_1'), senderId: toOpenId('ou_1'), eventId: toEventId('ev-1') })
+    await h.ingest.dispose()
+    expect(h.exits).toEqual([])
+    expect(await readFile(join(h.root, 'closed'), 'utf8')).toBe('unsubscribed')
   })
 
-  it('buffers stdout lines that arrive before the ready marker', async () => {
-    // The fixture writes the marker and the events back-to-back; the reader
-    // side must not drop lines that lose the cross-pipe race.
-    process.env.FAKE_EVENTS = JSON.stringify([EVENT])
-    const { ingest, captured } = runOnce({})
-    try {
-      ingest.start()
-      for (let i = 0; i < 100 && captured.events.length < 1; i++) await new Promise(resolve => setTimeout(resolve, 20))
-      expect(captured.events).toHaveLength(1)
-    } finally {
-      await ingest.dispose()
-      cleanEnv()
-    }
+  it('deduplicates redeliveries across child restarts', async () => {
+    const h = await harness({ events: [EVENT, EVENT], exitAfterEvents: true })
+    await h.ingest.start()
+    await h.exit
+    expect(h.events).toHaveLength(1)
+    await h.ingest.start()
+    await h.ingest.dispose()
+    expect(h.events).toHaveLength(1)
+    expect(h.exits[0]).toContain('code=7')
   })
 
-  it('skips unparseable and non-event lines with a warning', async () => {
-    process.env.FAKE_EVENTS = JSON.stringify([EVENT])
-    const { ingest, captured } = runOnce({ FAKE_JUNK: '1' })
-    try {
-      ingest.start()
-      for (let i = 0; i < 100 && captured.events.length < 1; i++) await new Promise(resolve => setTimeout(resolve, 20))
-      expect(captured.events).toHaveLength(1)
-      expect(captured.warns.some(line => line.includes('unparseable'))).toBe(true)
-      expect(captured.warns.filter(line => line.includes('not a receive-message event'))).toHaveLength(2)
-    } finally {
-      await ingest.dispose()
-      cleanEnv()
-    }
+  it('evicts only the oldest ids when deduplication reaches its configured capacity', async () => {
+    const h = await harness({ events: [EVENT, { ...EVENT, event_id: 'ev-2' }, { ...EVENT, event_id: 'ev-3' }, EVENT], exitAfterEvents: true }, { dedupCapacity: 2 })
+    await h.ingest.start()
+    await h.exit
+    expect(h.events.map(event => event.eventId)).toEqual(['ev-1', 'ev-2', 'ev-3', 'ev-1'])
   })
 
-  it('reports an unexpected exit when the consumer crashes before the marker', async () => {
-    const { ingest, captured } = runOnce({ FAKE_CRASH: '1' })
-    try {
-      ingest.start()
-      for (let i = 0; i < 100 && captured.exits.length < 1; i++) await new Promise(resolve => setTimeout(resolve, 20))
-      expect(captured.exits[0]).toContain('before ready marker')
-    } finally {
-      await ingest.dispose()
-      cleanEnv()
-    }
+  it('skips malformed payloads and contains subscriber exceptions', async () => {
+    const h = await harness({ junk: true, events: [EVENT, { ...EVENT, event_id: 'ev-2' }], exitAfterEvents: true }, { throwOnEvent: true })
+    await h.ingest.start()
+    await h.exit
+    expect(h.events).toHaveLength(2)
+    expect(h.warns.filter(message => message.includes('unparseable'))).toHaveLength(1)
+    expect(h.warns.filter(message => message.includes('not a receive-message event'))).toHaveLength(2)
+    expect(h.warns.filter(message => message.includes('subscriber broke'))).toHaveLength(2)
   })
 
-  it('rejects start after dispose and double start while running', async () => {
-    process.env.FAKE_EVENTS = '[]'
-    const { ingest } = runOnce({})
-    try {
-      ingest.start()
-      expect(() => ingest.start()).toThrow(/already running/)
-    } finally {
-      await ingest.dispose()
-      cleanEnv()
-    }
-    expect(() => ingest.start()).toThrow(/disposed/)
+  it('rejects startup when a consumer exits before readiness', async () => {
+    const h = await harness({ crashBeforeReady: true })
+    await expect(h.ingest.start()).rejects.toThrow('before ready marker')
+    expect(h.exits).toEqual([])
+  })
+
+  it('rejects a wrong event-key marker and gracefully closes the startup child', async () => {
+    const h = await harness({ eventKey: 'im.message.message_read_v1' }, { readyTimeoutMs: 100 })
+    vi.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] })
+    onTestFinished(() => { vi.useRealTimers() })
+    const starting = h.ingest.start()
+    const rejected = expect(starting).rejects.toThrow('ready marker was not received')
+    await h.wrongMarker
+    await vi.advanceTimersByTimeAsync(100)
+    await rejected
+    expect(await readFile(join(h.root, 'closed'), 'utf8')).toBe('unsubscribed')
+    expect(h.exits).toEqual([])
+  })
+
+  it('rejects a missing executable without a restart notification', async () => {
+    const exits: string[] = []
+    const ingest = new LarkIngest('/no-such-dsh-lark-executable', [], {
+      onEvent: () => {}, onUnexpectedExit: reason => { exits.push(reason) }, logger: { info: () => {}, warn: () => {} },
+    }, { eventKey: 'im.message.receive_v1', readyTimeoutMs: 30_000, dedupCapacity: 1 })
+    onTestFinished(() => ingest.dispose())
+    await expect(ingest.start()).rejects.toThrow('spawn failed')
+    expect(exits).toEqual([])
+  })
+
+  it('stops admission before EOF and waits for actual unsubscribe completion', async () => {
+    const h = await harness({ events: [EVENT], gateShutdown: true, lateEvents: [{ ...EVENT, event_id: 'late' }] })
+    await h.ingest.start()
+    await h.eventArrived
+    const disposal = h.ingest.dispose()
+    expect(h.ingest.dispose()).toBe(disposal)
+    let settled = false
+    void disposal.then(() => { settled = true })
+    // The child writes this file only after receiving EOF, then blocks on our release file.
+    await expect.poll(() => readFile(join(h.root, 'eof'), 'utf8')).toBe('stdin closed')
+    expect(settled).toBe(false)
+    await writeFile(join(h.root, 'shutdown'), '')
+    await disposal
+    expect(await readFile(join(h.root, 'closed'), 'utf8')).toBe('unsubscribed')
+    expect(h.events).toHaveLength(1)
+    expect(h.exits).toEqual([])
+    expect(() => h.ingest.start()).toThrow('disposed')
+  })
+
+  it('rejects simultaneous starts and cancels a pending startup on disposal', async () => {
+    const h = await harness({ gateReady: true })
+    const starting = h.ingest.start()
+    const rejected = expect(starting).rejects.toThrow('disposed before readiness')
+    expect(() => h.ingest.start()).toThrow('already running')
+    await h.beforeReady
+    await h.ingest.dispose()
+    await rejected
   })
 })

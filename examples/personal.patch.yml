@@ -1,0 +1,7 @@
+# Merge into your profile patch after replacing the sender ID and workspace.
+- id: lark
+  config:
+    allowedSenders: [ou_your_open_id]
+    workspacePath: ~/projects/my-project
+    groupPolicy: disabled
+    locale: en

@@ -8,10 +8,11 @@
 import { execFile } from 'node:child_process'
 import type { LarkChatId, LarkMessageId } from './brand.ts'
 
-/** One `lark-cli` JSON envelope; `ok` is the CLI's own success flag. */
-interface LarkCliEnvelope {
-  ok: boolean
-  error?: { message?: string }
+/** Narrow a process JSON value to a non-array record. */
+function asRecord(value: unknown): Record<string, unknown> | undefined {
+  return value !== null && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : undefined
 }
 
 /** Run one `lark-cli` invocation and require a successful JSON envelope. */
@@ -26,26 +27,29 @@ async function runLarkCli(command: string, args: readonly string[], timeoutMs: n
       rejectPromise(new Error(`lark-cli ${String(args[0])} ${String(args[1])} failed: ${error.message}${detail === '' ? '' : ` — ${detail}`}`))
     })
   })
-  let envelope: LarkCliEnvelope
+  let parsed: unknown
   try {
-    envelope = JSON.parse(stdout) as LarkCliEnvelope
+    parsed = JSON.parse(stdout)
   } catch {
     throw new Error(`lark-cli ${String(args[0])} ${String(args[1])} printed unparseable output: ${stdout.slice(0, 200)}`)
   }
-  if (envelope.ok !== true) {
-    throw new Error(`lark-cli ${String(args[0])} ${String(args[1])} reported failure: ${envelope.error?.message ?? 'unknown error'}`)
+  const envelope = asRecord(parsed)
+  if (envelope?.['ok'] !== true) {
+    const message = asRecord(envelope?.['error'])?.['message']
+    throw new Error(`lark-cli ${String(args[0])} ${String(args[1])} reported failure: ${typeof message === 'string' ? message : 'missing successful response envelope'}`)
   }
 }
 
 /**
  * Fail loud at load when the configured CLI binary is missing or not runnable.
  * @param command - `lark-cli` executable path.
+ * @param timeoutMs - maximum wait for the CLI process.
  * @returns when `--version` exits successfully.
  * @throws with the spawn or exit failure.
  */
-export async function assertLarkCliAvailable(command: string): Promise<void> {
+export async function assertLarkCliAvailable(command: string, timeoutMs: number): Promise<void> {
   await new Promise<void>((resolvePromise, rejectPromise) => {
-    execFile(command, ['--version'], { timeout: 10_000 }, error => {
+    execFile(command, ['--version'], { timeout: timeoutMs }, error => {
       if (error === null) {
         resolvePromise()
         return
@@ -57,15 +61,14 @@ export async function assertLarkCliAvailable(command: string): Promise<void> {
 
 /**
  * Detect the bot's own display name so rendered `@{name}` prefixes can be
- * stripped exactly. Best-effort: callers treat any failure as "name unknown"
- * and fall back to the first-token heuristic.
+ * stripped exactly. The service requires a name when group handling is enabled.
  * @param command - `lark-cli` executable path.
- * @param identity - `--as` identity for the API call.
+ * @param timeoutMs - maximum wait for the CLI process.
  * @returns the trimmed app name, or `undefined` when unavailable.
  */
-export async function fetchBotName(command: string, identity: string): Promise<string | undefined> {
+export async function fetchBotName(command: string, timeoutMs: number): Promise<string | undefined> {
   const stdout = await new Promise<string>((resolvePromise, rejectPromise) => {
-    execFile(command, ['api', 'GET', '/open-apis/bot/v3/info', '--as', identity], { timeout: 15_000, maxBuffer: 1024 * 1024 }, (error, out, stderr) => {
+    execFile(command, ['api', 'GET', '/open-apis/bot/v3/info', '--as', 'bot'], { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (error, out, stderr) => {
       if (error === null) {
         resolvePromise(out)
         return
@@ -74,16 +77,17 @@ export async function fetchBotName(command: string, identity: string): Promise<s
       rejectPromise(new Error(`lark-cli bot info failed: ${error.message}${detail === '' ? '' : ` — ${detail}`}`))
     })
   })
+  let parsed: unknown
   try {
-    const parsed = JSON.parse(stdout) as { code?: number; bot?: { app_name?: unknown } }
-    const name = parsed.bot?.app_name
-    if (parsed.code !== 0 || typeof name !== 'string' || name.trim() === '') return undefined
-    return name.trim()
+    parsed = JSON.parse(stdout)
   } catch {
-    // The CLI printed something other than the expected JSON envelope;
-    // auto-detection is best-effort, so report the name as unknown.
+    // Bot-name lookup is optional; non-JSON output cannot supply a display name.
     return undefined
   }
+  const result = asRecord(parsed)
+  const name = asRecord(result?.['bot'])?.['app_name']
+  if (result?.['code'] !== 0 || typeof name !== 'string' || name.trim() === '') return undefined
+  return name.trim()
 }
 
 /** Outbound Feishu messaging used by the bridge. */
@@ -105,12 +109,12 @@ export class LarkEgress implements Egress {
 
   /** @inheritDoc */
   async reply(messageId: LarkMessageId, text: string): Promise<void> {
-    await runLarkCli(this.command, ['im', '+messages-reply', '--message-id', messageId, '--text', text], this.timeoutMs)
+    await runLarkCli(this.command, ['im', '+messages-reply', '--as', 'bot', '--message-id', messageId, '--text', text], this.timeoutMs)
   }
 
   /** @inheritDoc */
   async send(chatId: LarkChatId, text: string): Promise<void> {
-    await runLarkCli(this.command, ['im', '+messages-send', '--chat-id', chatId, '--text', text], this.timeoutMs)
+    await runLarkCli(this.command, ['im', '+messages-send', '--as', 'bot', '--chat-id', chatId, '--text', text], this.timeoutMs)
   }
 }
 
@@ -122,6 +126,7 @@ export class LarkEgress implements Egress {
  * @returns the original text, or the head plus an ellipsis.
  */
 export function truncateReply(text: string, maxChars: number): string {
-  if (text.length <= maxChars) return text
-  return `${text.slice(0, Math.max(1, maxChars - 1))}…`
+  const characters = Array.from(text)
+  if (characters.length <= maxChars) return text
+  return `${characters.slice(0, maxChars - 1).join('')}…`
 }

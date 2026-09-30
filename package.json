@@ -1,14 +1,47 @@
 {
   "name": "dsh-lark",
-  "description": "Lark/Feishu bridge bundle: drive dsh sessions from chat messages and reply in chat",
+  "description": "Run DeepSeek Harness sessions from Lark and Feishu chats",
   "version": "0.2.0",
   "private": true,
+  "license": "MIT",
   "type": "module",
-  "main": "lib/index.mjs",
+  "main": "./lib/index.mjs",
+  "exports": {
+    ".": "./lib/index.mjs",
+    "./package.json": "./package.json"
+  },
   "files": [
     "lib/index.mjs",
-    "cordis.patch.yml"
+    "cordis.patch.yml",
+    "examples",
+    "docs",
+    "README.zh-CN.md",
+    "DESIGN.md",
+    "DESIGN.zh-CN.md",
+    "SECURITY.md",
+    "SECURITY.zh-CN.md",
+    "CONTRIBUTING.md",
+    "CONTRIBUTING.zh-CN.md"
   ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/ChengqianHuang/dsh-lark.git"
+  },
+  "homepage": "https://github.com/ChengqianHuang/dsh-lark#readme",
+  "bugs": "https://github.com/ChengqianHuang/dsh-lark/issues",
+  "keywords": [
+    "dsh-plugin",
+    "deepseek",
+    "lark",
+    "feishu",
+    "agent",
+    "chatbot",
+    "cordis"
+  ],
+  "engines": {
+    "node": "^22.19.0 || >=24.0.0"
+  },
+  "packageManager": "pnpm@11.7.0",
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
@@ -16,22 +49,33 @@
   },
   "scripts": {
     "build": "tsdown",
-    "test": "vitest run"
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:package": "node scripts/check-package.mjs",
+    "check": "pnpm typecheck && pnpm test && pnpm build && pnpm test:package",
+    "prepack": "pnpm build"
   },
   "peerDependencies": {
-    "@deepseek-ai/cordis": "*",
-    "@deepseek-ai/dsh-agent": "*",
-    "@deepseek-ai/dsh-agent-default-model": "*",
-    "@deepseek-ai/dsh-brand": "*",
-    "@deepseek-ai/dsh-llm": "*",
-    "@deepseek-ai/dsh-session": "*",
-    "@deepseek-ai/dsh-session-title": "*",
-    "@deepseek-ai/dsh-util-values": "*",
-    "@deepseek-ai/dsh-workspace": "*",
-    "@deepseek-ai/schemastery": "*"
+    "@deepseek-ai/cordis": "4.0.2",
+    "@deepseek-ai/dsh-agent": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-agent-default-model": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-agent-presets": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-brand": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-llm": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-permission-presets": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-session": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-session-title": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-workspace": "0.1.2-alpha.5",
+    "@deepseek-ai/schemastery": "3.18.2"
   },
   "devDependencies": {
-    "tsdown": "^0.22.2",
-    "vitest": "^4.1.8"
+    "@deepseek-ai/dsh-agent-loop": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-session-projection": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-system-prompt": "0.1.2-alpha.5",
+    "@deepseek-ai/dsh-tools": "0.1.2-alpha.5",
+    "@types/node": "22.20.0",
+    "tsdown": "0.22.2",
+    "typescript": "6.0.3",
+    "vitest": "4.1.8"
   }
 }

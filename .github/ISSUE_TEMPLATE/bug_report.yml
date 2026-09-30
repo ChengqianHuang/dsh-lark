@@ -1,0 +1,32 @@
+name: Bug report / 缺陷报告
+description: Report a reproducible problem with setup, chat control, or delivery.
+title: "[Bug] "
+body:
+  - type: markdown
+    attributes:
+      value: "Keep tokens, app secrets, message content, and personal identifiers out of this report. Use SECURITY.md for vulnerabilities. 可使用中文填写，请先脱敏。"
+  - type: textarea
+    id: versions
+    attributes:
+      label: Versions and environment / 版本与环境
+      description: Plugin revision, dsh version, lark-cli version, Node.js version, OS, and direct or group chat.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Steps to reproduce / 复现步骤
+      description: Include a minimal redacted configuration and the command or message that triggers the problem.
+    validations:
+      required: true
+  - type: textarea
+    id: result
+    attributes:
+      label: Expected and actual result / 预期与实际结果
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs / 脱敏日志
+      render: text

@@ -1,0 +1,23 @@
+name: Feature request / 功能建议
+description: Explain a chat workflow that the plugin does not handle.
+title: "[Feature] "
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: User problem / 用户问题
+      description: What task are you trying to complete from Lark or Feishu? 可使用中文填写。
+    validations:
+      required: true
+  - type: textarea
+    id: outcome
+    attributes:
+      label: Desired result / 期望结果
+      description: Give an example message and describe the observable response or action.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Existing workaround / 现有替代办法
+      description: Describe any workaround and its limitation.

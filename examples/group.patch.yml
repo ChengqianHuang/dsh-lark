@@ -1,0 +1,9 @@
+# Everyone in this group can see replies; approved senders share its session.
+- id: lark
+  config:
+    allowedSenders: [ou_first_open_id, ou_second_open_id]
+    allowedChats: [oc_your_chat_id]
+    workspacePath: ~/projects/shared-project
+    groupPolicy: mentions
+    botName: My dsh bot
+    locale: zh-CN

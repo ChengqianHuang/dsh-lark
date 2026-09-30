@@ -1,52 +1,73 @@
-/**
- * Plugin config resolution for `dsh-lark`. Every deployment-varying choice is
- * a validated config field; the resolve step computes defaults and fails loud
- * on invalid values. The listened event key stays a fixed protocol constant.
- * @module
- */
+/** Validated deployment settings for the Lark bot bridge. @module */
 
 import { homedir } from 'node:os'
-import { isAbsolute, resolve } from 'node:path'
+import { isAbsolute, normalize } from 'node:path'
 
-/** Loader-facing plugin config; every field is optional with a default. */
+/** Languages supported by bridge commands and diagnostics sent to chats. */
+export type Locale = 'zh-CN' | 'en'
+
+/** Loader configuration. At least one allowed sender is required unless access is explicitly open. */
 export interface Config {
-  /** `lark-cli` executable; resolved through PATH when bare. */
+  /** CLI executable, resolved through PATH when bare. */
   larkCliPath?: string
-  /** Identity for `event consume` (`bot` or `user`); `bot` needs no login. */
+  /** The receive-message event supports bot identity only. */
   identity?: string
-  /** Sender open_id allowlist; empty admits every sender the bot can hear. */
+  /** Sender open IDs allowed to drive local sessions. */
   allowedSenders?: string[]
-  /** Chat id allowlist; empty admits every chat the bot is in. */
+  /** Explicitly allow every sender visible to the bot. */
+  allowAllSenders?: boolean
+  /** Restrict accepted chat IDs; empty permits any chat for an allowed sender. */
   allowedChats?: string[]
-  /** Absolute workspace directory the driven sessions run in. */
+  /** Require an exact leading bot mention in groups, or disable groups. */
+  groupPolicy?: 'mentions' | 'disabled'
+  /** Language of bridge replies; model answers retain their original language. */
+  locale?: Locale
+  /** Absolute working directory; a leading ~/ expands to the home directory. */
   workspacePath?: string
-  /** Chat idle minutes after which the next message starts a fresh session. */
+  /** Idle lifetime before the next request replaces a session. */
   sessionIdleMinutes?: number
-  /** Delay before restarting a crashed ingress consumer. */
+  /** Delay before restarting a consumer that exits after becoming ready. */
   restartDelayMs?: number
-  /** Reply length bound; longer answers truncate with an ellipsis. */
+  /** Deadline for the consumer's ready marker. */
+  ingressReadyTimeoutMs?: number
+  /** Deadline for each outbound CLI invocation. */
+  egressTimeoutMs?: number
+  /** Maximum remembered event IDs across consumer restarts. */
+  dedupCapacity?: number
+  /** Maximum waiting messages per chat, excluding the running message. */
+  maxPendingMessagesPerChat?: number
+  /** Maximum chat sessions held by this plugin. */
+  maxActiveChats?: number
+  /** Maximum Unicode code points in one reply, including its ellipsis. */
   maxReplyChars?: number
-  /** Session title prefix shown in the web UI. */
+  /** Prefix of session titles in the web UI; spaces are preserved. */
   titlePrefix?: string
-  /** Optional agent preset mounted into every driven session. */
+  /** Agent preset; absence uses the host's configured default. */
   agentPreset?: string
-  /** Optional permission preset applied to every driven session. */
+  /** Permission preset; absence preserves host defaults. */
   permissionPreset?: string
-  /** Bot display name for exact @mention stripping; auto-detected when absent. */
+  /** Exact bot display name; absence triggers discovery through bot/v3/info. */
   botName?: string
 }
 
-/** Resolved deployment settings; defaults were computed once at resolve. */
+/** Fully resolved settings shared by transport and chat routing. */
 export interface LarkSettings {
   larkCliPath: string
-  identity: string
-  /** Fixed ingress protocol key; not configurable. */
+  identity: 'bot'
   eventKey: 'im.message.receive_v1'
   allowedSenders: readonly string[]
+  allowAllSenders: boolean
   allowedChats: readonly string[]
+  groupPolicy: 'mentions' | 'disabled'
+  locale: Locale
   workspacePath: string
   sessionIdleMs: number
   restartDelayMs: number
+  ingressReadyTimeoutMs: number
+  egressTimeoutMs: number
+  dedupCapacity: number
+  maxPendingMessagesPerChat: number
+  maxActiveChats: number
   maxReplyChars: number
   titlePrefix: string
   agentPreset: string | undefined
@@ -54,86 +75,87 @@ export interface LarkSettings {
   botName: string | undefined
 }
 
-/** Validate one optional non-empty string, returning the default when absent. */
-function optionalString(value: string | undefined, fallback: string, label: string): string {
-  if (value === undefined) return fallback
-  const trimmed = value.trim()
-  if (trimmed === '') throw new Error(`dsh-lark: ${label} must not be blank`)
-  return trimmed
-}
-
-/** Validate one optional preset name, keeping absence as `undefined`. */
-function optionalPreset(value: string | undefined, label: string): string | undefined {
+/** Validate a nonblank optional string. */
+function optionalString(value: string | undefined, label: string): string | undefined {
   if (value === undefined) return undefined
-  const trimmed = value.trim()
-  if (trimmed === '') throw new Error(`dsh-lark: ${label} must not be blank when set`)
-  return trimmed
+  if (value.trim() === '') throw new Error(`dsh-lark: ${label} must not be blank`)
+  return value.trim()
 }
 
-/** Validate one optional allowlist; entries must be non-empty after trim. */
-function allowlist(value: string[] | undefined, label: string): readonly string[] {
-  if (value === undefined) return []
-  return value.map(entry => {
+/** Validate and deduplicate wire identifiers in an allowlist. */
+function allowlist(value: string[] | undefined, prefix: string, label: string): readonly string[] {
+  return [...new Set((value ?? []).map(entry => {
     const trimmed = entry.trim()
-    if (trimmed === '') throw new Error(`dsh-lark: ${label} must not contain blank entries`)
+    if (!trimmed.startsWith(prefix) || trimmed.length === prefix.length || /\s/.test(trimmed)) {
+      throw new Error(`dsh-lark: ${label} must contain ${prefix}… identifiers`)
+    }
     return trimmed
-  })
+  }))]
 }
 
-/** Validate one optional positive integer. */
-function positiveInt(value: number | undefined, fallback: number, label: string): number {
-  if (value === undefined) return fallback
-  if (!Number.isSafeInteger(value) || value <= 0) {
-    throw new Error(`dsh-lark: ${label} must be a positive integer, got ${String(value)}`)
+/** Validate a deployment integer, bounding values used by Node timers when requested. */
+function positiveInt(value: number | undefined, fallback: number, label: string, max = Number.MAX_SAFE_INTEGER): number {
+  const resolved = value ?? fallback
+  if (!Number.isSafeInteger(resolved) || resolved <= 0 || resolved > max) {
+    throw new Error(`dsh-lark: ${label} must be a positive integer no greater than ${String(max)}`)
   }
-  return value
+  return resolved
 }
 
-/** Validate one optional positive finite number; fractional values are allowed. */
-function positiveNumber(value: number | undefined, fallback: number, label: string): number {
-  if (value === undefined) return fallback
-  if (!Number.isFinite(value) || value <= 0) {
-    throw new Error(`dsh-lark: ${label} must be a positive finite number, got ${String(value)}`)
-  }
-  return value
-}
-
-/** Expand a leading `~` to the home directory and require an absolute path. */
-function resolveWorkspacePath(value: string | undefined): string {
-  const raw = value === undefined ? '~/.dsh/lark/workspace' : value.trim()
-  if (raw === '') throw new Error('dsh-lark: workspacePath must not be blank')
-  const expanded = raw === '~' || raw.startsWith('~/')
-    ? homedir() + raw.slice(1)
-    : raw
-  const absolute = resolve(expanded)
-  if (!isAbsolute(absolute)) throw new Error(`dsh-lark: workspacePath must be absolute, got ${JSON.stringify(value)}`)
-  return absolute
+/** Expand a home prefix before checking the configured path. */
+function workspacePath(value: string | undefined): string {
+  const raw = optionalString(value, 'workspacePath') ?? '~/.dsh/lark/workspace'
+  const expanded = raw === '~' || raw.startsWith('~/') ? homedir() + raw.slice(1) : raw
+  if (!isAbsolute(expanded)) throw new Error('dsh-lark: workspacePath must be absolute or start with ~/')
+  return normalize(expanded)
 }
 
 /**
- * Validate the loader config and compute defaults.
- * @param config - loader-validated plugin config.
- * @returns the resolved settings used by the service.
- * @throws on blank strings, non-positive numbers, or a relative workspace path.
+ * Validate configuration and compute defaults before starting a subscription.
+ * @param config - Loader-validated settings.
+ * @returns Settings with explicit access policy and bounded timers.
+ * @throws For invalid values or an unspecified sender policy.
  */
 export function resolveLarkConfig(config: Config): LarkSettings {
-  const identity = optionalString(config.identity, 'bot', 'identity')
-  if (identity !== 'bot' && identity !== 'user' && identity !== 'auto') {
-    throw new Error(`dsh-lark: identity must be bot, user, or auto, got ${JSON.stringify(identity)}`)
+  const identity = optionalString(config.identity, 'identity') ?? 'bot'
+  if (identity !== 'bot') throw new Error('dsh-lark: identity must be bot; im.message.receive_v1 supports bot identity only')
+  const allowedSenders = allowlist(config.allowedSenders, 'ou_', 'allowedSenders')
+  const allowAllSenders = config.allowAllSenders ?? false
+  if (!allowAllSenders && allowedSenders.length === 0) {
+    throw new Error('dsh-lark: configure allowedSenders with your open ID, or explicitly set allowAllSenders: true')
+  }
+  if (allowAllSenders && allowedSenders.length > 0) {
+    throw new Error('dsh-lark: choose allowedSenders or allowAllSenders, not both')
+  }
+  const locale = config.locale ?? 'zh-CN'
+  if (locale !== 'zh-CN' && locale !== 'en') throw new Error('dsh-lark: locale must be zh-CN or en')
+  const groupPolicy = config.groupPolicy ?? 'mentions'
+  if (groupPolicy !== 'mentions' && groupPolicy !== 'disabled') throw new Error('dsh-lark: groupPolicy must be mentions or disabled')
+  const sessionIdleMs = (config.sessionIdleMinutes ?? 30) * 60_000
+  if (!Number.isFinite(sessionIdleMs) || sessionIdleMs < 1 || sessionIdleMs > Number.MAX_SAFE_INTEGER) {
+    throw new Error('dsh-lark: sessionIdleMinutes must describe a finite positive duration of at least one millisecond')
   }
   return {
-    larkCliPath: optionalString(config.larkCliPath, 'lark-cli', 'larkCliPath'),
+    larkCliPath: optionalString(config.larkCliPath, 'larkCliPath') ?? 'lark-cli',
     identity,
     eventKey: 'im.message.receive_v1',
-    allowedSenders: allowlist(config.allowedSenders, 'allowedSenders'),
-    allowedChats: allowlist(config.allowedChats, 'allowedChats'),
-    workspacePath: resolveWorkspacePath(config.workspacePath),
-    sessionIdleMs: positiveNumber(config.sessionIdleMinutes, 30, 'sessionIdleMinutes') * 60_000,
-    restartDelayMs: positiveInt(config.restartDelayMs, 3_000, 'restartDelayMs'),
+    allowedSenders,
+    allowAllSenders,
+    allowedChats: allowlist(config.allowedChats, 'oc_', 'allowedChats'),
+    groupPolicy,
+    locale,
+    workspacePath: workspacePath(config.workspacePath),
+    sessionIdleMs,
+    restartDelayMs: positiveInt(config.restartDelayMs, 3_000, 'restartDelayMs', 2_147_483_647),
+    ingressReadyTimeoutMs: positiveInt(config.ingressReadyTimeoutMs, 30_000, 'ingressReadyTimeoutMs', 2_147_483_647),
+    egressTimeoutMs: positiveInt(config.egressTimeoutMs, 30_000, 'egressTimeoutMs', 2_147_483_647),
+    dedupCapacity: positiveInt(config.dedupCapacity, 1_000, 'dedupCapacity'),
+    maxPendingMessagesPerChat: positiveInt(config.maxPendingMessagesPerChat, 8, 'maxPendingMessagesPerChat'),
+    maxActiveChats: positiveInt(config.maxActiveChats, 32, 'maxActiveChats'),
     maxReplyChars: positiveInt(config.maxReplyChars, 4_000, 'maxReplyChars'),
-    titlePrefix: optionalString(config.titlePrefix, '[lark] ', 'titlePrefix'),
-    agentPreset: optionalPreset(config.agentPreset, 'agentPreset'),
-    permissionPreset: optionalPreset(config.permissionPreset, 'permissionPreset'),
-    botName: optionalPreset(config.botName, 'botName'),
+    titlePrefix: config.titlePrefix ?? '[lark] ',
+    agentPreset: optionalString(config.agentPreset, 'agentPreset'),
+    permissionPreset: optionalString(config.permissionPreset, 'permissionPreset'),
+    botName: optionalString(config.botName, 'botName'),
   }
 }

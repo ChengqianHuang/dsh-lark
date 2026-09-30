@@ -1,82 +1,133 @@
+---
+description: "Run local dsh tasks from Lark or Feishu and receive each task's answer in chat."
+kind: "package-bundle"
+---
+
 # dsh-lark
 
-https://github.com/ChengqianHuang/dsh-lark · topic: `dsh-plugin`
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE) [![CI](https://github.com/ChengqianHuang/dsh-lark/actions/workflows/ci.yml/badge.svg)](https://github.com/ChengqianHuang/dsh-lark/actions/workflows/ci.yml)
 
-个人侧 Lark/飞书桥接 bundle：在飞书里给机器人发消息，消息实时驱动本机 dsh 会话，会话跑完把最终回答回复到聊天里。飞书是遥控器，dsh 是引擎，`lark-cli` 是两侧的传输层。
+**Your local coding agent, a chat message away.**
 
-安装与使用见 dsh 用户文档 `docs/user/develop/basic/publish.md`。设计决策见 [DESIGN.md](DESIGN.md)。
+English | [简体中文](README.zh-CN.md)
 
-## 安装（dsh 源码运行模式下）
+## Summary
 
-本仓库 clone（或 link）到任意位置后，在 dsh 仓库根目录安装进 profile：
+Send your Lark or Feishu bot a task. [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) runs it in your local workspace and replies to the message that started it. Review a change, investigate a failing test, or ask about your code while keeping the session available in the dsh Web UI.
+
+- **Continue the conversation.** Each chat keeps its own session; follow-up messages retain context.
+- **Stay in control.** Restrict senders and chats, inspect `/status`, interrupt with `/stop`, and start fresh with `/new`.
+- **Use your existing dsh setup.** Sessions inherit the host's default agent preset and permission policy.
+- **Keep setup local.** The bridge uses [lark-cli](https://github.com/larksuite/cli) event subscriptions; it opens no public webhook endpoint.
+
+Example prompts: “Explain this repository's entry points”, “Review the changes in my workspace”, or “Find why the parser test fails”. Available actions depend on your dsh tools and permissions.
+
+## Table of Contents
+
+- [Use this package](#use-this-package)
+- [Commands](#commands)
+- [Understand the implementation](#understand-the-implementation)
+- [Further Exploration](#further-exploration)
+- [Model Experience](#model-experience)
+- [Known Limitations and Deferred Work](#known-limitations-and-deferred-work)
+
+-----
+
+<a id="use-this-package"></a>
+## Use this package
+
+You need a working dsh installation, Node.js `^22.19.0 || >=24.0.0`, pnpm, and a configured Lark or Feishu bot with `lark-cli` on your PATH. The current compatibility target is dsh `0.1.2-alpha.5`; see [setup](docs/setup.md) for credentials, scopes, and your sender ID.
+
+### 1. Build and install the bundle
 
 ```sh
-# 从本仓库的本地 clone 安装（link 模式，源码即生效）
-pnpm dsh plugin --profile web add /path/to/dsh-lark
-pnpm dsh --profile web --dump-config               # 验证出现 "# == dsh-lark" 层
-pnpm dsh web                                       # 启动后从飞书对话
+git clone https://github.com/ChengqianHuang/dsh-lark.git
+cd dsh-lark
+pnpm install --frozen-lockfile
+pnpm build
+dsh plugin --profile web add "$PWD"
 ```
 
-卸载：`pnpm dsh plugin --profile web remove dsh-lark`。
+The local checkout is linked into the `web` profile. Rebuild it after changing source. If you run dsh from source, use `pnpm dsh` from the harness repository for the `dsh` commands; pass the absolute plugin directory to `add`.
 
-前置条件（加载时逐项响亮校验）：
+### 2. Allow your account
 
-- `lark-cli` 在 PATH 中（或用 `larkCliPath` 指定绝对路径），且应用已开通「接收消息」事件（`im.message.receive_v1`）；
-- 配置里的 `workspacePath` 会自动创建。
-
-配置（可选，写进 profile 的 cordis.patch.yml 或由默认值兜底）：
+Merge this entry into `${DSH_HOME:-$HOME/.dsh}/profiles/web/cordis.patch.yml`, replacing the example sender ID. Keep any existing entries in that file.
 
 ```yaml
 - id: lark
-  name: dsh-lark
   config:
-    # larkCliPath: lark-cli              # 默认走 PATH
-    # identity: bot                      # 收消息用 bot 身份，无需 auth login
-    allowedSenders: [ou_c4198d18421b0749d2a7c79409a76ef3]   # 建议显式配置
-    # allowedChats: []                   # 空 = 机器人能听到的所有会话
-    # workspacePath: ~/.dsh/lark/workspace
-    # sessionIdleMinutes: 30             # 聊天闲置多久后，下一条消息开新会话
-    # restartDelayMs: 3000               # 消费进程崩溃后的重启延迟
-    # maxReplyChars: 4000                # 回复长度上限，超出截断
-    # titlePrefix: "[lark] "             # web UI 会话标题前缀
-    # agentPreset: coder                 # 可选：挂进驱动会话的 agent preset
-    # permissionPreset: yolo             # 可选：驱动会话的权限 preset
+    allowedSenders: [ou_your_open_id]
+    workspacePath: ~/projects/my-project
+    groupPolicy: disabled
+    locale: en
 ```
 
-## 触发规则
+Start with direct messages. To enable groups, use `groupPolicy: mentions` and restrict `allowedChats`; see the [configuration reference](docs/configuration.md). An empty sender allowlist fails startup unless you explicitly enable `allowAllSenders`. The example uses English notices; set `locale: zh-CN` for Chinese.
 
-- **私聊**：机器人收到的每条文本消息都是命令。
-- **群聊**：只有 **@机器人** 的文本消息是命令（飞书本身也只向机器人推送 @它 的群消息）。
-- 消息原文（含 @前缀）原样进入会话；`event_id` 去重，重连补投不会重复执行。
-- `allowedSenders` / `allowedChats` 为空表示不限制；个人机建议配白名单。
-
-## 斜杠命令
-
-以 `/` 开头的消息（群聊里 @机器人 后跟命令）控制桥接本身，不进入 agent：
-
-- `/new` — 结束当前会话，下一条消息开始新会话
-- `/stop` — 立即停止正在运行的回合（旁路排队，即时生效）
-- `/status` — 查看当前会话与闲置倒计时
-- `/help` — 显示可用命令
-
-未知命令会回复提示，不会转发给 agent。@前缀按机器人显示名精确剥离（加载时自动从 API 获取，`botName` 配置可覆盖；拿不到名字时退化为首 token 启发式），所以发给 agent 的文本不再带 `@机器人` 噪声。被停止的回合回复「已停止本轮」。
-
-## 会话映射与回复
-
-- 每个 chat 最多挂一个活跃会话；首条消息创建会话（出现在 web UI 的 workspace 列表，标题带 `titlePrefix`）。
-- 会话空闲超过 `sessionIdleMinutes` 后，该聊天下一条消息开新会话，旧会话正常释放。
-- 每条消息是一次独立的 followup 回合；会话运行中再来的消息由 agent 自行排队。
-- 回合结束后取最后一段 assistant 文本，优先 `+messages-reply` 回到触发消息，失败则退回 `+messages-send` 发到聊天；超过 `maxReplyChars` 截断。
-- 创建会话、回合执行、回复发送失败都会把错误文本发回聊天，不静默。
-
-## 构建 / 测试
+### 3. Start and try it
 
 ```sh
-(cd dsh-lark && pnpm install --ignore-workspace --config.auto-install-peers=false)
-(cd dsh-lark && pnpm exec tsdown)                    # 产出 lib/index.mjs
-pnpm exec vitest run --config dsh-lark/vitest.config.ts
-pnpm exec tsc -p dsh-lark/tsconfig.json --noEmit
+dsh --profile web --dump-config
+dsh web
 ```
 
-修改源码后重新 `pnpm exec tsdown` 即可（profile 里是 link，指向本目录）。
-类型检查读取 DSH 各依赖包的声明文件；首次运行前需先构建上层 DSH 仓库。
+The config dump should contain the `dsh-lark` layer and your settings; it does not check Lark connectivity. Send `/help` to your bot, then ask it to describe the workspace. Open the session in the Web UI to inspect tool activity or handle permission requests.
+
+To remove the bundle, run `dsh plugin --profile web remove dsh-lark`. Saved dsh session history remains subject to your host's retention policy.
+
+<a id="commands"></a>
+## Commands
+
+| Message | Result |
+|---|---|
+| Plain text | Run one task in this chat's session; additional tasks wait in a bounded queue. |
+| `/status` | Show the current session, running state, and queue without waiting for a task. |
+| `/stop` | Cancel the current bridge task and clear pending messages. |
+| `/new` | Cancel bridge work, clear pending messages, and reset this chat's session. |
+| `/help` | Show available commands immediately. |
+
+In groups, begin with the bot's exact `@display name`. Unknown slash commands return help and never run as agent prompts. Bot notices support English and Simplified Chinese; the model chooses its answer language from the conversation.
+
+-----
+
+<a id="understand-the-implementation"></a>
+## Understand the implementation
+
+<details>
+<summary>Message flow and session ownership</summary>
+
+`lark-cli` delivers message events → sender/chat checks admit them → a chat queue submits a dsh turn → the bridge selects that turn's recorded answer → `lark-cli` replies to its originating message.
+
+The bundle's [patch](cordis.patch.yml) installs the `lark` row. The [service](https://github.com/ChengqianHuang/dsh-lark/blob/main/src/index.ts) owns the event consumer and [router](https://github.com/ChengqianHuang/dsh-lark/blob/main/src/bridge.ts); the host owns agents, tools, credentials, permissions, and durable session history. See [design](DESIGN.md) for concurrency, disposal, and delivery guarantees.
+
+</details>
+
+<a id="further-exploration"></a>
+## Further Exploration
+
+- [Setup](docs/setup.md) · [Configuration](docs/configuration.md) · [Troubleshooting](docs/troubleshooting.md)
+- [Security and data handling](SECURITY.md) · [Contributing](CONTRIBUTING.md) · [MIT license](LICENSE)
+- [Personal and group examples](examples/)
+
+<a id="model-experience"></a>
+## Model Experience
+
+Accepted text becomes a logged user message with its Lark chat, sender, and message IDs. The bridge removes the leading bot mention and handles slash commands itself. The agent preset provides tools and prompts; the bridge adds no model tool. Only the completed turn's final text is sent back to chat, subject to the configured length limit.
+
+<a id="known-limitations-and-deferred-work"></a>
+## Known Limitations and Deferred Work
+
+Text messages and plain-text replies are supported. Attachments, cards, streamed replies, and approvals inside Lark are not supported. Long answers are truncated; inspect the dsh session for the full response.
+
+Chat sessions share the configured filesystem workspace and host permissions. Group members can see replies and share that group's conversation context. Chat bindings, queued messages, and deduplication memory do not survive plugin restarts. This is a trusted-user integration, with no exactly-once delivery guarantee; review the [security model](SECURITY.md) before adding other users.
+
+<a id="dev-note"></a>
+### Dev Note
+
+<details>
+<summary>Working context for maintainers</summary>
+
+None.
+
+</details>

@@ -1,10 +1,6 @@
 /**
- * Ingress: owns one `lark-cli event consume` child process. The child prints
- * events to stdout as NDJSON and follows the lark-cli subprocess contract: a
- * `[event] ready event_key=…` marker on stderr gates stdout reading, stdin
- * must never EOF while running, graceful shutdown is SIGTERM (never SIGKILL,
- * which leaks server-side subscriptions), and one process listens to exactly
- * one event key.
+ * One supervised `lark-cli event consume` child. Readiness comes from stderr;
+ * closing its piped stdin requests graceful server-side unsubscribe.
  * @module
  */
 
@@ -15,120 +11,164 @@ import { parseLarkMessageEvent, type LarkMessageEvent } from './types.ts'
 /** Prefix of the stderr line that marks a ready consumer. */
 export const READY_MARKER_PREFIX = '[event] ready event_key='
 
-/** Bounded redelivery-deduplication memory before the oldest ids are dropped. */
-const DEDUP_CAPACITY = 1_000
-
-/** Drop a whole batch from the dedup set once capacity overflows. */
-const DEDUP_DROP_BATCH = 200
-
-/** Host callbacks the ingest process drives. */
+/** Host callbacks for accepted events and consumer failures. */
 export interface LarkIngestHost {
   /** Accepted, deduplicated receive-message events in arrival order. */
   onEvent(event: LarkMessageEvent): void
-  /** The consumer exited on its own (crash or protocol failure) while not disposed. */
+  /** A ready consumer exited while the bridge was still accepting messages. */
   onUnexpectedExit(reason: string): void
-  /** Diagnostic sink for protocol lines and skipped payloads. */
+  /** Diagnostics from the consumer and event dispatcher. */
   logger: { info(message: string): void; warn(message: string): void }
 }
 
-/**
- * Spawn, supervise, and gracefully stop one bounded consumer process. The
- * caller owns restart policy: unexpected exits are reported, and a healthy
- * restart is a fresh {@link LarkIngest.start} on the same instance.
- */
+/** Resolved limits and protocol selection for a consumer. */
+export interface LarkIngestOptions {
+  /** Event key required in the ready marker. */
+  eventKey: 'im.message.receive_v1'
+  /** Maximum wait for the consumer's ready marker. */
+  readyTimeoutMs: number
+  /** Maximum retained event ids across consumer restarts. */
+  dedupCapacity: number
+}
+
+/** One child generation and its owned completion signals. */
+interface ConsumerRun {
+  child: ReturnType<typeof spawn>
+  closed: Promise<void>
+  rejectReady(error: Error): void
+  ready: boolean
+  closing: boolean
+}
+
+/** A restartable consumer whose disposal waits for the child and pipes to close. */
 export class LarkIngest {
-  private child: ReturnType<typeof spawn> | undefined
+  private run: ConsumerRun | undefined
   private disposed = false
-  private ready = false
-  private reported = false
-  private readonly pendingLines: string[] = []
+  private disposal: Promise<void> | undefined
   private readonly seenEvents = new Set<string>()
-  private readonly seenOrder: string[] = []
 
   /**
-   * Store the fixed spawn parameters; nothing runs until {@link start}.
+   * Store resolved launch parameters without starting a subprocess.
    * @param command - `lark-cli` executable path.
-   * @param args - full argv, including the single event key.
-   * @param host - event and exit callbacks.
+   * @param args - full argv, including exactly one event key.
+   * @param host - event, exit, and diagnostic callbacks.
+   * @param options - resolved readiness and deduplication limits.
    */
   constructor(
     private readonly command: string,
     private readonly args: readonly string[],
     private readonly host: LarkIngestHost,
+    private readonly options: LarkIngestOptions,
   ) {}
 
-  /** Spawn the consumer; a previous instance must have exited or been disposed. */
-  start(): void {
+  /**
+   * Start one consumer and wait for its exact ready marker.
+   * @returns readiness, or a rejection after startup failure and child cleanup.
+   * @throws if already running or permanently disposed.
+   */
+  start(): Promise<void> {
     if (this.disposed) throw new Error('dsh-lark: ingest is disposed and cannot restart')
-    if (this.child !== undefined) throw new Error('dsh-lark: ingest is already running')
-    this.ready = false
-    this.reported = false
+    if (this.run !== undefined) throw new Error('dsh-lark: ingest is already running')
     const child = spawn(this.command, [...this.args], { stdio: ['pipe', 'pipe', 'pipe'] })
-    this.child = child
-    // The piped stdin is never written or closed, so it never EOFs — exactly
-    // the lark-cli contract for an unbounded subscriber.
-    child.on('error', error => {
-      this.child = undefined
-      if (this.disposed || this.reported) return
-      this.reported = true
-      this.host.onUnexpectedExit(`spawn failed: ${String(error)}`)
+    const readiness = Promise.withResolvers<void>()
+    const completion = Promise.withResolvers<void>()
+    const run: ConsumerRun = {
+      child,
+      closed: completion.promise,
+      rejectReady: readiness.reject,
+      ready: false,
+      closing: false,
+    }
+    this.run = run
+    let failure: string | undefined
+    let lastDiagnostic = ''
+    const stdout = createInterface(child.stdout)
+    stdout.pause()
+    const stderr = createInterface(child.stderr)
+    const timer = setTimeout(() => {
+      failure = `ready marker was not received within ${String(this.options.readyTimeoutMs)}ms`
+      readiness.reject(new Error(`dsh-lark: ${failure}`))
+      this.closeRun(run)
+    }, this.options.readyTimeoutMs)
+
+    child.stdin.on('error', error => {
+      if (!run.closing) this.host.logger.warn(`dsh-lark: consumer stdin failed: ${String(error)}`)
     })
-    child.on('exit', (code, signal) => {
-      this.child = undefined
-      if (this.disposed || this.reported) return
-      this.reported = true
-      this.host.onUnexpectedExit(this.ready
-        ? `consumer exited (code=${String(code)} signal=${String(signal)})`
-        : `exited before ready marker (code=${String(code)} signal=${String(signal)})`)
+    child.once('error', error => {
+      failure = `spawn failed: ${String(error)}`
+      readiness.reject(new Error(`dsh-lark: ${failure}`))
     })
-    createInterface(child.stderr).on('line', line => this.onProtocolLine(line))
-    createInterface(child.stdout).on('line', line => this.onEventLine(line))
+    child.once('close', (code, signal) => {
+      clearTimeout(timer)
+      stdout.close()
+      stderr.close()
+      this.run = undefined
+      completion.resolve()
+      const reason = failure ?? `${run.ready ? 'consumer exited' : 'exited before ready marker'} (code=${String(code)} signal=${String(signal)})${lastDiagnostic === '' ? '' : `: ${lastDiagnostic}`}`
+      if (!run.ready) readiness.reject(new Error(`dsh-lark: ${reason}`))
+      if (!this.disposed && run.ready && !run.closing) {
+        try {
+          this.host.onUnexpectedExit(reason)
+        } catch (error: unknown) {
+          this.host.logger.warn(`dsh-lark: exit callback failed: ${String(error)}`)
+        }
+      }
+    })
+    stderr.on('line', (line: string) => {
+      if (this.disposed || run.closing) return
+      const trimmed = line.trim()
+      if (trimmed === '') return
+      if (!run.ready && trimmed === `${READY_MARKER_PREFIX}${this.options.eventKey}`) {
+        run.ready = true
+        clearTimeout(timer)
+        this.host.logger.info(`dsh-lark: ingress ready (${this.options.eventKey})`)
+        readiness.resolve()
+        stdout.resume()
+        return
+      }
+      lastDiagnostic = trimmed.slice(0, 1_024)
+      this.host.logger.info(`dsh-lark: ingest: ${lastDiagnostic}`)
+    })
+    stdout.on('line', (line: string) => {
+      if (!this.disposed && !run.closing && run.ready) this.onEventLine(line)
+    })
+    return readiness.promise.catch(async (error: unknown) => {
+      clearTimeout(timer)
+      this.closeRun(run)
+      await run.closed
+      throw error
+    })
   }
 
   /**
-   * Stop the consumer with SIGTERM and resolve on exit; a consumer still
-   * running after the grace period gets SIGKILL.
-   * @param graceMs - SIGTERM-to-SIGKILL grace; defaults to 5000.
+   * Close admission, request graceful unsubscribe with stdin EOF, and wait for exit.
+   * @returns the shared completion promise, including when called repeatedly.
    */
-  async dispose(graceMs = 5_000): Promise<void> {
-    const child = this.child
+  dispose(): Promise<void> {
+    if (this.disposal !== undefined) return this.disposal
     this.disposed = true
-    if (child === undefined) return
-    child.kill('SIGTERM')
-    await new Promise<void>(resolveSettle => {
-      const timer = setTimeout(() => {
-        child.kill('SIGKILL')
-        resolveSettle()
-      }, graceMs)
-      child.once('exit', () => {
-        clearTimeout(timer)
-        resolveSettle()
-      })
-    })
-    this.child = undefined
-  }
-
-  /** One stderr protocol line: the ready marker flips reading on; the rest is diagnostics. */
-  private onProtocolLine(line: string): void {
-    const trimmed = line.trim()
-    if (trimmed === '') return
-    if (!this.ready && trimmed.startsWith(READY_MARKER_PREFIX)) {
-      this.ready = true
-      this.host.logger.info(`dsh-lark: ingress ready (${trimmed.slice(READY_MARKER_PREFIX.length)})`)
-      for (const buffered of this.pendingLines) this.onEventLine(buffered)
-      this.pendingLines.length = 0
-      return
+    const run = this.run
+    if (run !== undefined) {
+      run.rejectReady(new Error('dsh-lark: ingest disposed before readiness'))
+      this.closeRun(run)
     }
-    this.host.logger.info(`dsh-lark: ingest: ${trimmed}`)
+    // TODO: escalate to SIGKILL after a grace period when the child ignores
+    // stdin EOF; an unresponsive consumer currently delays teardown.
+    this.disposal = run?.closed ?? Promise.resolve()
+    return this.disposal
   }
 
-  /** One stdout line: buffered until the ready marker, then parsed, deduplicated, and dispatched. */
+  /** Ask this generation to unsubscribe; stdin remains open until this call. */
+  private closeRun(run: ConsumerRun): void {
+    if (run.closing) return
+    run.closing = true
+    run.child.stdin?.end()
+  }
+
+  /** Validate one NDJSON event and contain consumer callback failures. */
   private onEventLine(line: string): void {
     const trimmed = line.trim()
-    if (trimmed === '' || !this.ready) {
-      if (trimmed !== '' && !this.ready) this.pendingLines.push(trimmed)
-      return
-    }
+    if (trimmed === '') return
     let parsed: unknown
     try {
       parsed = JSON.parse(trimmed)
@@ -141,18 +181,16 @@ export class LarkIngest {
       this.host.logger.warn('dsh-lark: ingest skipped a line that is not a receive-message event')
       return
     }
-    if (!this.rememberEvent(event.eventId)) return
-    this.host.onEvent(event)
-  }
-
-  /** Record one event id; returns `false` for a redelivery. */
-  private rememberEvent(eventId: string): boolean {
-    if (this.seenEvents.has(eventId)) return false
-    this.seenEvents.add(eventId)
-    this.seenOrder.push(eventId)
-    if (this.seenOrder.length > DEDUP_CAPACITY) {
-      for (const dropped of this.seenOrder.splice(0, DEDUP_DROP_BATCH)) this.seenEvents.delete(dropped)
+    if (this.seenEvents.has(event.eventId)) return
+    this.seenEvents.add(event.eventId)
+    if (this.seenEvents.size > this.options.dedupCapacity) {
+      const oldest = this.seenEvents.values().next().value
+      if (oldest !== undefined) this.seenEvents.delete(oldest)
     }
-    return true
+    try {
+      this.host.onEvent(event)
+    } catch (error: unknown) {
+      this.host.logger.warn(`dsh-lark: event callback failed: ${String(error)}`)
+    }
   }
 }

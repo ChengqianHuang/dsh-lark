@@ -1,328 +1,146 @@
-import { describe, expect, it } from 'vitest'
-import type { Context } from '@deepseek-ai/cordis'
-import type { Agent } from '@deepseek-ai/dsh-agent'
-import { ChatRouter } from '../src/bridge.ts'
-import { resolveLarkConfig, type LarkSettings } from '../src/config.ts'
-import type { Egress } from '../src/egress.ts'
-import { toChatId, toEventId, toMessageId, toOpenId } from '../src/brand.ts'
-import type { LarkMessageEvent } from '../src/types.ts'
+import { afterEach, describe, expect, it, vi } from 'vitest'
+import { createUserMessage } from '@deepseek-ai/dsh-llm'
+import { copy } from '../src/i18n.ts'
+import { blockedStream, event, runtime } from './helpers/runtime.ts'
 
-/** In-memory session log the fake agent appends to; reply/reason shape the turn. */
-interface FakeSessionLog {
-  events: Array<{ type: string; data: unknown }>
-  reply: string
-  reason: unknown
-  /** Defer `whenIdle` until the fake cancel resolves it. */
-  deferIdle: boolean
+const cleanups: Array<() => Promise<void>> = []
+afterEach(async () => { for (const cleanup of cleanups.splice(0).reverse()) await cleanup(); vi.restoreAllMocks() })
+async function setup(...args: Parameters<typeof runtime>) {
+  const h = await runtime(...args)
+  cleanups.push(() => h.close())
+  return h
 }
 
-interface FakeAgent {
-  agent: Agent
-  cancelCalls: Array<unknown>
-  resolveIdle(): void
-}
-
-function makeAgent(log: FakeSessionLog, messages: Array<unknown>): FakeAgent {
-  const cancelCalls: Array<unknown> = []
-  let resolveIdle: (() => void) | undefined
-  const agent = {
-    session: {
-      get seq(): number {
-        return log.events.length
-      },
-      eventAt: (seq: number) => log.events[seq],
-    },
-    followup(message: unknown): void {
-      messages.push(message)
-      log.events.push({ type: 'turn/start', data: {} })
-      // A deferred turn is "still running": only cancel closes it.
-      if (!log.deferIdle) {
-        log.events.push({ type: 'assistant/message', data: { message: { content: [{ type: 'text', text: log.reply }] } } })
-        log.events.push({ type: 'turn/end', data: { reason: log.reason } })
-      }
-    },
-    whenIdle(): Promise<void> {
-      if (!log.deferIdle) return Promise.resolve()
-      return new Promise<void>(resolve => {
-        resolveIdle = resolve
-      })
-    },
-    cancel(cause: unknown): void {
-      cancelCalls.push(cause)
-      log.events.push({ type: 'turn/end', data: { reason: { kind: 'aborted', reason: cause } } })
-      resolveIdle?.()
-    },
-  }
-  return {
-    agent: agent as unknown as Agent,
-    cancelCalls,
-    resolveIdle: () => resolveIdle?.(),
-  }
-}
-
-interface Harness {
-  ctx: Context
-  settings: LarkSettings
-  created: string[]
-  disposed: string[]
-  titles: string[]
-  logs: Array<{ log: FakeSessionLog; messages: Array<unknown>; fake: FakeAgent }>
-}
-
-function harness(overrides: { sessionIdleMinutes?: number; maxReplyChars?: number; botName?: string; deferIdle?: boolean } = {}): Harness {
-  const created: string[] = []
-  const disposed: string[] = []
-  const titles: string[] = []
-  const logs: Array<{ log: FakeSessionLog; messages: Array<unknown>; fake: FakeAgent }> = []
-  const ctx = {
-    agents: {
-      create: async (options: { sessionId: string }) => {
-        created.push(options.sessionId)
-        const log: FakeSessionLog = { events: [], reply: 'ok', reason: { kind: 'completed' }, deferIdle: overrides.deferIdle === true }
-        const messages: Array<unknown> = []
-        const fake = makeAgent(log, messages)
-        logs.push({ log, messages, fake })
-        return {
-          agent: fake.agent,
-          dispose: async () => { disposed.push(options.sessionId) },
-        }
-      },
-    },
-    agentDefaultModel: { currentSelection: () => ({ provider: 'deepseek', model: 'dsh' }) },
-    agentPresets: {
-      resolve: async () => {
-        throw new Error('no preset roster in tests')
-      },
-      mount: async () => {},
-    },
-    permissionPresets: { resolve: () => 'granted', set: () => {} },
-    sessionTitle: { rename: (_session: unknown, title: string) => { titles.push(title) } },
-    workspaceRegistry: {
-      create: async (path: string) => ({ path, attachSession: async () => {}, detachSession: async () => {} }),
-    },
-    logger: { info: () => {}, warn: () => {} },
-  } as unknown as Context
-  const settings = resolveLarkConfig({ workspacePath: '/tmp/dsh-lark-test', ...overrides })
-  return { ctx, settings, created, disposed, titles, logs }
-}
-
-class RecordingEgress implements Egress {
-  readonly calls: Array<{ kind: string; target: string; text: string }> = []
-  failReply = false
-
-  async reply(messageId: string, text: string): Promise<void> {
-    if (this.failReply) throw new Error('reply transport down')
-    this.calls.push({ kind: 'reply', target: messageId, text })
-  }
-
-  async send(chatId: string, text: string): Promise<void> {
-    this.calls.push({ kind: 'send', target: chatId, text })
-  }
-}
-
-function event(overrides: Partial<LarkMessageEvent> = {}): LarkMessageEvent {
-  return {
-    eventId: toEventId(`ev-${String(Math.random())}`),
-    messageId: toMessageId('om_1'),
-    chatId: toChatId('oc_1'),
-    chatType: 'p2p',
-    messageType: 'text',
-    senderId: toOpenId('ou_1'),
-    content: '帮我跑测试',
-    createTimeMs: '1',
-    ...overrides,
-  }
-}
-
-async function settle(router: ChatRouter): Promise<void> {
-  await router.settle()
-}
-
-/** Yield one macrotask so an immediate (chain-bypassing) /stop handler settles. */
-async function tick(): Promise<void> {
-  await new Promise(resolve => setTimeout(resolve, 10))
-}
-
-describe('ChatRouter turns', () => {
-  it('creates a titled session, forwards the stripped text with the lark source, and replies with the turn text', async () => {
-    const h = harness({ botName: '测试Bot' })
-    const egress = new RecordingEgress()
-    const router = new ChatRouter(h.ctx, h.settings, egress)
-    router.handle(event({ content: '@测试Bot 帮我跑测试' }))
-    await settle(router)
-    expect(h.created).toHaveLength(1)
-    expect(h.titles[0]).toBe('[lark] 帮我跑测试')
-    const message = h.logs[0]?.messages[0] as { content: Array<{ text: string }>; source: { kind: string; chatId: string; senderId: string } }
-    expect(message.content[0]?.text).toBe('帮我跑测试')
-    expect(message.source).toMatchObject({ kind: 'lark', chatId: 'oc_1', senderId: 'ou_1' })
-    expect(egress.calls).toEqual([{ kind: 'reply', target: 'om_1', text: 'ok' }])
-    await router.dispose()
+describe('chat sessions through the published agent runtime', () => {
+  it('mounts the default preset, records source metadata, and reuses the session', async () => {
+    const h = await setup(['first', 'second'], { botName: 'My bot' })
+    h.router.handle(event('one', '@My bot run tests'))
+    await h.router.settle()
+    h.router.handle(event('two', 'continue'))
+    await h.router.settle()
+    expect(h.created).toHaveBeenCalledTimes(1)
+    expect(h.resolve).toHaveBeenCalledWith(undefined)
+    expect(h.mount).toHaveBeenCalledWith(expect.anything(), 'standard')
+    const input = h.agents[0]?.session.snapshotEvents().find(e => e.type === 'user/message')
+    expect(input?.data).toMatchObject({ content: [{ type: 'text', text: 'run tests' }], source: { kind: 'lark', messageId: 'om_one', chatId: 'oc_test', senderId: 'ou_owner' } })
+    expect(h.egress.calls.map(call => call.text)).toEqual(['first', 'second'])
   })
 
-  it('reuses the chat session for a second message', async () => {
-    const h = harness()
-    const router = new ChatRouter(h.ctx, h.settings, new RecordingEgress())
-    router.handle(event())
-    await settle(router)
-    router.handle(event({ messageId: toMessageId('om_2') }))
-    await settle(router)
-    expect(h.created).toHaveLength(1)
-    expect(h.logs[0]?.messages).toHaveLength(2)
-    await router.dispose()
+  it('replies with the owned turn while a later UI turn is still running', async () => {
+    const foreign = blockedStream()
+    const h = await setup(['lark answer', foreign.script])
+    const replied = Promise.withResolvers<void>()
+    h.egress.onReply = text => { if (text === 'lark answer') replied.resolve() }
+    const off = h.ctx.on('agent/turn-stopping', ({ agent }) => {
+      off()
+      agent.followup(createUserMessage({ content: [{ type: 'text', text: 'private UI request' }], source: { kind: 'user' } }))
+    })
+    h.router.handle(event())
+    await foreign.started
+    await replied.promise
+    expect(h.egress.calls).toEqual([{ kind: 'reply', target: 'om_one', text: 'lark answer' }])
+    expect(h.agents[0]?.status).toBe('running')
+    h.agents[0]?.cancel({ kind: 'user' })
+    await h.router.settle()
   })
 
-  it('starts a fresh session after the idle window and disposes the old one', async () => {
-    const h = harness({ sessionIdleMinutes: 0.0002 })
-    const router = new ChatRouter(h.ctx, h.settings, new RecordingEgress())
-    router.handle(event())
-    await settle(router)
-    await new Promise(resolve => setTimeout(resolve, 30))
-    router.handle(event())
-    await settle(router)
-    expect(h.created).toHaveLength(2)
-    expect(h.disposed).toHaveLength(1)
-    await router.dispose()
+  it('keeps /status responsive and reports cancellation instead of partial output', async () => {
+    const blocked = blockedStream()
+    const h = await setup([blocked.script], { locale: 'en' })
+    h.router.handle(event())
+    await blocked.started
+    const status = Promise.withResolvers<void>()
+    h.egress.onReply = text => { if (text.includes('Status: running')) status.resolve() }
+    h.router.handle(event('status', '/status'))
+    await status.promise
+    h.router.handle(event('stop', '/stop'))
+    await h.router.settle()
+    await blocked.ended
+    expect(h.egress.calls.find(call => call.target === 'om_one')?.text).toBe(copy.en.stopped)
+    expect(h.egress.calls.every(call => !call.text.includes('partial answer'))).toBe(true)
   })
 
-  it('falls back to a plain chat send when the reply fails', async () => {
-    const h = harness()
-    const egress = new RecordingEgress()
-    egress.failReply = true
-    const router = new ChatRouter(h.ctx, h.settings, egress)
-    router.handle(event())
-    await settle(router)
-    expect(egress.calls).toEqual([{ kind: 'send', target: 'oc_1', text: 'ok' }])
-    await router.dispose()
+  it('bounds its queue and /stop clears messages that have not entered the agent', async () => {
+    const blocked = blockedStream()
+    const h = await setup([blocked.script], { locale: 'en', maxPendingMessagesPerChat: 1 })
+    h.router.handle(event())
+    await blocked.started
+    h.router.handle(event('two', 'next'))
+    h.router.handle(event('three', 'overflow'))
+    h.router.handle(event('stop', '/stop'))
+    await h.router.settle()
+    expect(h.model.requests).toHaveLength(1)
+    expect(h.egress.calls.find(call => call.target === 'om_three')?.text).toContain('queue is full')
+    expect(h.egress.calls.find(call => call.target === 'om_stop')?.text).toContain('Cleared 1')
   })
 
-  it('reports an error turn and a stopped turn through the reply path', async () => {
-    const h = harness()
-    const egress = new RecordingEgress()
-    const router = new ChatRouter(h.ctx, h.settings, egress)
-    router.handle(event())
-    await settle(router)
-    const log = h.logs[0]?.log
-    if (log === undefined) throw new Error('missing fake session log')
-    log.reply = ''
-    log.reason = { kind: 'error', error: { code: 'boom', message: '模型不可用' } }
-    router.handle(event({ messageId: toMessageId('om_3') }))
-    await settle(router)
-    log.reason = { kind: 'aborted', reason: { kind: 'user' } }
-    router.handle(event({ messageId: toMessageId('om_4') }))
-    await settle(router)
-    expect(egress.calls.map(call => call.text)).toEqual(['ok', 'dsh 本轮出错：模型不可用', '已停止本轮。'])
-    await router.dispose()
+  it('resets immediately and gives following work a fresh session', async () => {
+    const blocked = blockedStream()
+    const h = await setup([blocked.script, 'fresh'], { locale: 'en' })
+    h.router.handle(event())
+    await blocked.started
+    h.router.handle(event('oldqueue', 'discard this'))
+    h.router.handle(event('reset', '/new'))
+    h.router.handle(event('fresh', 'new task'))
+    await h.router.settle()
+    expect(h.created).toHaveBeenCalledTimes(2)
+    expect(h.model.requests).toHaveLength(2)
+    expect(h.egress.calls.findLast(call => call.target === 'om_fresh')?.text).toBe('fresh')
   })
 
-  it('truncates replies beyond the configured bound', async () => {
-    const h = harness({ maxReplyChars: 5 })
-    const egress = new RecordingEgress()
-    const router = new ChatRouter(h.ctx, h.settings, egress)
-    router.handle(event())
-    await settle(router)
-    const log = h.logs[0]?.log
-    if (log === undefined) throw new Error('missing fake session log')
-    log.reply = 'abcdefghijklmno'
-    router.handle(event({ messageId: toMessageId('om_4') }))
-    await settle(router)
-    expect(egress.calls.at(-1)?.text).toBe('abcd…')
-    await router.dispose()
-  })
-})
-
-describe('ChatRouter bridge commands', () => {
-  it('answers /help and unknown commands without creating a session', async () => {
-    const h = harness()
-    const egress = new RecordingEgress()
-    const router = new ChatRouter(h.ctx, h.settings, egress)
-    router.handle(event({ content: '/help' }))
-    await settle(router)
-    router.handle(event({ content: '/foo bar' }))
-    await settle(router)
-    expect(h.created).toHaveLength(0)
-    expect(egress.calls).toHaveLength(2)
-    expect(egress.calls[0]?.text).toContain('可用命令')
-    expect(egress.calls[1]?.text).toContain('未知命令 /foo')
-    await router.dispose()
+  it('closes admission, cancels model work and suppresses late replies during unload', async () => {
+    const blocked = blockedStream()
+    const h = await setup([blocked.script])
+    h.router.handle(event())
+    await blocked.started
+    const first = h.router.dispose()
+    expect(h.router.dispose()).toBe(first)
+    h.router.handle(event('late', 'must not run'))
+    await first
+    await blocked.ended
+    expect(h.egress.calls).toEqual([])
+    expect(h.ctx.agents.get(h.agents[0]!.id)).toBeUndefined()
   })
 
-  it('handles group commands after exact mention stripping', async () => {
-    const h = harness({ botName: '测试Bot' })
-    const egress = new RecordingEgress()
-    const router = new ChatRouter(h.ctx, h.settings, egress)
-    router.handle(event({ chatType: 'group', content: '@测试Bot /help' }))
-    await settle(router)
-    expect(h.created).toHaveLength(0)
-    expect(egress.calls[0]?.text).toContain('可用命令')
-    await router.dispose()
+  it('does not expose internal errors and falls back when anchored replies fail', async () => {
+    const h = await setup([async function* () { throw new Error('/private/local/path: credential missing') }], { locale: 'en' })
+    h.egress.failReply = true
+    h.router.handle(event())
+    await h.router.settle()
+    expect(h.egress.calls).toEqual([{ kind: 'send', target: 'oc_test', text: copy.en.failed }])
+    expect(h.logger.warn).toHaveBeenCalled()
   })
 
-  it('ends the session on /new and reports an absent session', async () => {
-    const h = harness()
-    const egress = new RecordingEgress()
-    const router = new ChatRouter(h.ctx, h.settings, egress)
-    router.handle(event({ content: '/new' }))
-    await settle(router)
-    expect(egress.calls[0]?.text).toContain('当前没有活跃会话')
-    router.handle(event({ content: '第一条' }))
-    await settle(router)
-    router.handle(event({ content: '/new', messageId: toMessageId('om_2') }))
-    await settle(router)
-    expect(h.created).toHaveLength(1)
-    expect(h.disposed).toHaveLength(1)
-    expect(egress.calls.at(-1)?.text).toContain('已结束当前会话')
-    router.handle(event({ content: '第二条', messageId: toMessageId('om_3') }))
-    await settle(router)
-    expect(h.created).toHaveLength(2)
-    await router.dispose()
+  it('expires idle sessions using the configured clock interval', async () => {
+    const clock = vi.spyOn(Date, 'now').mockReturnValue(1_000)
+    const h = await setup(['one', 'two'], { sessionIdleMinutes: 1 })
+    h.router.handle(event())
+    await h.router.settle()
+    clock.mockReturnValue(61_001)
+    h.router.handle(event('two', 'again'))
+    await h.router.settle()
+    expect(h.created).toHaveBeenCalledTimes(2)
   })
 
-  it('reports status with the session id and state', async () => {
-    const h = harness()
-    const egress = new RecordingEgress()
-    const router = new ChatRouter(h.ctx, h.settings, egress)
-    router.handle(event({ content: '/status' }))
-    await settle(router)
-    expect(egress.calls[0]?.text).toContain('当前没有活跃会话')
-    router.handle(event({ content: '开始会话' }))
-    await settle(router)
-    router.handle(event({ content: '/status', messageId: toMessageId('om_2') }))
-    await settle(router)
-    const status = egress.calls.at(-1)?.text ?? ''
-    expect(status).toContain('会话 lark-')
-    expect(status).toContain('空闲')
-    await router.dispose()
+  it('limits active chats and allows a new chat after /new releases an old one', async () => {
+    const h = await setup(['one', 'two'], { maxActiveChats: 1, locale: 'en' })
+    h.router.handle(event())
+    await h.router.settle()
+    h.router.handle(event('other', 'hello', 'oc_other'))
+    await h.router.settle()
+    expect(h.egress.calls.at(-1)?.text).toContain('active chat limit')
+    h.router.handle(event('reset', '/new'))
+    await h.router.settle()
+    h.router.handle(event('other2', 'hello', 'oc_other'))
+    await h.router.settle()
+    expect(h.created).toHaveBeenCalledTimes(2)
   })
 
-  it('stops a running turn immediately and lets the aborted turn reply', async () => {
-    const h = harness({ deferIdle: true })
-    const egress = new RecordingEgress()
-    const router = new ChatRouter(h.ctx, h.settings, egress)
-    router.handle(event({ content: '长任务' }))
-    await tick()
-    const entry = h.logs[0]
-    if (entry === undefined) throw new Error('missing fake session')
-    router.handle(event({ content: '/stop', messageId: toMessageId('om_9') }))
-    await tick()
-    expect(entry.fake.cancelCalls).toEqual([{ kind: 'user' }])
-    entry.fake.resolveIdle()
-    await settle(router)
-    expect(egress.calls).toEqual([{ kind: 'reply', target: 'om_1', text: '已停止本轮。' }])
-    await router.dispose()
-  })
-
-  it('answers /stop when nothing is running', async () => {
-    const h = harness()
-    const egress = new RecordingEgress()
-    const router = new ChatRouter(h.ctx, h.settings, egress)
-    router.handle(event({ content: '/stop' }))
-    await tick()
-    expect(egress.calls).toEqual([{ kind: 'reply', target: 'om_1', text: '当前没有活跃会话。' }])
-    router.handle(event({ content: '开始会话', messageId: toMessageId('om_2') }))
-    await settle(router)
-    router.handle(event({ content: '/stop', messageId: toMessageId('om_3') }))
-    await tick()
-    expect(egress.calls.at(-1)?.text).toBe('当前没有正在运行的回合。')
-    await router.dispose()
+  it('answers help, unknown commands and argument errors without creating sessions', async () => {
+    const h = await setup([], { locale: 'en' })
+    for (const [id, text] of [['help', '/help'], ['unknown', '/whatever'], ['args', '/new now'], ['malformed', '/'], ['status', '/status']] as const) h.router.handle(event(id, text))
+    await h.router.settle()
+    expect(h.created).not.toHaveBeenCalled()
+    expect(h.egress.calls.map(call => call.text)).toMatchSnapshot()
   })
 })

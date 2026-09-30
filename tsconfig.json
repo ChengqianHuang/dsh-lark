@@ -1,24 +1,26 @@
 {
-  // Typecheck the bundle against the built declarations of its DSH dependencies.
-  "extends": "../tsconfig.base.json",
   "compilerOptions": {
+    "target": "ES2024",
+    "module": "NodeNext",
+    "moduleResolution": "NodeNext",
     "noEmit": true,
-    "rootDir": "src",
-    "outDir": "lib/types"
+    "skipLibCheck": true,
+    "allowImportingTsExtensions": true,
+    "strict": true,
+    "noUncheckedIndexedAccess": true,
+    "exactOptionalPropertyTypes": true,
+    "noImplicitOverride": true,
+    "noFallthroughCasesInSwitch": true,
+    "noUnusedLocals": true,
+    "noUnusedParameters": true,
+    "types": [
+      "node"
+    ]
   },
-  "include": ["src"],
-  "references": [
-    { "path": "../vendor/cordis" },
-    { "path": "../vendor/schemastery" },
-    { "path": "../packages/core/agent" },
-    { "path": "../packages/core/agent-default-model" },
-    { "path": "../packages/core/session" },
-    { "path": "../packages/interaction/permission-presets" },
-    { "path": "../packages/llm/llm" },
-    { "path": "../packages/preset/agent-presets" },
-    { "path": "../packages/session/session-title" },
-    { "path": "../packages/util/brand" },
-    { "path": "../packages/util/values" },
-    { "path": "../packages/workspace/workspace" }
+  "include": [
+    "src",
+    "tests",
+    "tsdown.config.ts",
+    "vitest.config.ts"
   ]
 }

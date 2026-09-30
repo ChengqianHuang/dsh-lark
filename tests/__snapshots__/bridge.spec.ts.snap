@@ -1,0 +1,17 @@
+// Vitest Snapshot v1, https://vitest.dev/guide/snapshot.html
+
+exports[`chat sessions through the published agent runtime > answers help, unknown commands and argument errors without creating sessions 1`] = `
+[
+  "Commands:
+/new — End this session and clear queued messages
+/stop — Stop this request and clear queued messages
+/status — Show session and queue status
+/help — Show help
+
+Handle approval requests in the dsh Web UI.",
+  "Unknown command /whatever. Send /help to list commands.",
+  "/new does not accept arguments. Send /new on its own.",
+  "Unknown command /. Send /help to list commands.",
+  "No active session. Your next message will start one.",
+]
+`;

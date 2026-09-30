@@ -4,40 +4,31 @@ import { shouldAccept } from '../src/filter.ts'
 import { toChatId, toEventId, toMessageId, toOpenId } from '../src/brand.ts'
 import type { LarkMessageEvent } from '../src/types.ts'
 
-const settings = resolveLarkConfig({})
-
-function event(overrides: Partial<LarkMessageEvent> = {}): LarkMessageEvent {
-  return {
-    eventId: toEventId('ev-1'),
-    messageId: toMessageId('om_1'),
-    chatId: toChatId('oc_1'),
-    chatType: 'p2p',
-    messageType: 'text',
-    senderId: toOpenId('ou_1'),
-    content: '跑一下测试',
-    createTimeMs: '1',
-    ...overrides,
-  }
+const settings = resolveLarkConfig({ allowedSenders: ['ou_owner'], botName: 'My bot' })
+const base: LarkMessageEvent = {
+  eventId: toEventId('ev-1'), messageId: toMessageId('om_1'), chatId: toChatId('oc_1'),
+  chatType: 'p2p', messageType: 'text', senderId: toOpenId('ou_owner'), content: 'run tests', createTimeMs: '1',
 }
 
-describe('shouldAccept', () => {
-  it('accepts every p2p text message by default', () => {
-    expect(shouldAccept(event(), settings)).toBe(true)
+describe('access filter', () => {
+  it('admits authorized private text and rejects other senders', () => {
+    expect(shouldAccept(base, settings)).toBe(true)
+    expect(shouldAccept({ ...base, senderId: toOpenId('ou_stranger') }, settings)).toBe(false)
+    expect(shouldAccept({ ...base, senderId: toOpenId('ou_stranger') }, resolveLarkConfig({ allowAllSenders: true }))).toBe(true)
   })
 
-  it('accepts a group message only when it starts with @', () => {
-    expect(shouldAccept(event({ chatType: 'group', content: '@bot 跑测试' }), settings)).toBe(true)
-    expect(shouldAccept(event({ chatType: 'group', content: 'hello @bot' }), settings)).toBe(false)
+  it('requires an exact leading bot mention for groups', () => {
+    for (const content of ['hello @My bot', '@another /stop', '@My bot-evil /stop', '@My /stop']) {
+      expect(shouldAccept({ ...base, chatType: 'group', content }, settings)).toBe(false)
+    }
+    expect(shouldAccept({ ...base, chatType: 'group', content: '@My bot /stop' }, settings)).toBe(true)
+    expect(shouldAccept({ ...base, chatType: 'group', content: '@My bot /stop' }, { ...settings, groupPolicy: 'disabled' })).toBe(false)
+    expect(shouldAccept({ ...base, chatType: 'group', content: '@My bot /stop' }, { ...settings, botName: undefined })).toBe(false)
   })
 
-  it('ignores non-text messages', () => {
-    expect(shouldAccept(event({ messageType: 'image' }), settings)).toBe(false)
-    expect(shouldAccept(event({ messageType: 'interactive' }), settings)).toBe(false)
-  })
-
-  it('filters by sender and chat allowlists when configured', () => {
-    const narrowed = resolveLarkConfig({ allowedSenders: ['ou_2'], allowedChats: ['oc_2'] })
-    expect(shouldAccept(event(), narrowed)).toBe(false)
-    expect(shouldAccept(event({ senderId: toOpenId('ou_2'), chatId: toChatId('oc_2') }), narrowed)).toBe(true)
+  it('combines chat and sender restrictions and ignores non-text content', () => {
+    expect(shouldAccept(base, { ...settings, allowedChats: [toChatId('oc_other')] })).toBe(false)
+    expect(shouldAccept({ ...base, messageType: 'image' }, settings)).toBe(false)
+    expect(shouldAccept({ ...base, content: '  ' }, settings)).toBe(false)
   })
 })
